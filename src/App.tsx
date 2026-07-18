@@ -1,50 +1,96 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./App.css";
 
-function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+type AppEntry = { name: string; path: string };
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
+function score(query: string, name: string): number {
+  const q = query.toLowerCase();
+  const n = name.toLowerCase();
+  if (n === q) return 1000;
+  if (n.startsWith(q)) return 500 - n.length;
+  const idx = n.indexOf(q);
+  if (idx >= 0) return 200 - idx - n.length / 100;
+  let qi = 0;
+  for (let i = 0; i < n.length && qi < q.length; i++) {
+    if (n[i] === q[qi]) qi++;
   }
+  if (qi === q.length) return 50 - n.length;
+  return -1;
+}
+
+function App() {
+  const [apps, setApps] = useState<AppEntry[]>([]);
+  const [query, setQuery] = useState("");
+  const [selected, setSelected] = useState(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    invoke<AppEntry[]>("list_apps").then(setApps);
+    const unlisten = listen("bar-shown", () => {
+      setQuery("");
+      setSelected(0);
+      invoke<AppEntry[]>("list_apps").then(setApps);
+      inputRef.current?.focus();
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  const results = query
+    ? apps
+        .map((app) => ({ app, s: score(query, app.name) }))
+        .filter((r) => r.s >= 0)
+        .sort((a, b) => b.s - a.s)
+        .slice(0, 6)
+        .map((r) => r.app)
+    : [];
+
+  const launch = (path: string) => invoke("launch_app", { path });
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Escape") {
+      invoke("hide_bar");
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setSelected((s) => Math.min(s + 1, results.length - 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setSelected((s) => Math.max(s - 1, 0));
+    } else if (e.key === "Enter" && results[selected]) {
+      launch(results[selected].path);
+    }
+  };
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
+    <div className="bar" onKeyDown={onKeyDown}>
+      <input
+        ref={inputRef}
+        autoFocus
+        spellCheck={false}
+        value={query}
+        placeholder="Type to launch…"
+        onChange={(e) => {
+          setQuery(e.target.value);
+          setSelected(0);
         }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
-    </main>
+      />
+      {results.length > 0 && (
+        <ul className="results">
+          {results.map((r, i) => (
+            <li
+              key={r.path}
+              className={i === selected ? "selected" : ""}
+              onMouseDown={() => launch(r.path)}
+            >
+              {r.name}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 

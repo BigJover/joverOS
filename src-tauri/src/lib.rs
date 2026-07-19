@@ -71,7 +71,11 @@ const ROUTER_MODEL: &str = "llama3.1:8b";
 
 const ROUTER_PROMPT: &str = "You route commands for a desktop agent bar. Classify the user's input.\n\
 - app_launch: the user wants to open or launch an already-installed application (NOT install new software). Set \"app\" to the application name only.\n\
-- web_open: the user names a website, or a site plus a page or section of it (e.g. \"linkedin\", \"linkedin job board\", \"youtube\"). Set \"url\" to the real, well-known https:// URL for that exact page (e.g. https://www.linkedin.com/jobs/). Never invent a URL you are not sure exists — if unsure of the page, use the site's homepage.\n\
+- web_open: the user names a website, or a site plus something on it — a section, a channel, a profile, or content to find there. Set \"url\" to the real https:// URL:\n\
+  * site alone -> homepage (\"youtube\" -> https://www.youtube.com/)\n\
+  * site section -> its page (\"linkedin job board\" -> https://www.linkedin.com/jobs/)\n\
+  * a well-known channel/profile/person on the site -> their page (\"youtube mr beast\" -> https://www.youtube.com/@MrBeast, \"twitch jynxzi\" -> https://www.twitch.tv/jynxzi)\n\
+  * content to find on the site, or a person you don't know the exact page for -> the site's own search URL (\"youtube lofi study mix\" -> https://www.youtube.com/results?search_query=lofi+study+mix, \"amazon airpods\" -> https://www.amazon.com/s?k=airpods)\n\
 - web_search: the user wants to search the web or look up a question or topic. Set \"query\" to the search terms only.\n\
 For web_open and web_search: if the user names a browser (e.g. chrome, safari, firefox), also set \"app\" to that browser's name.\n\
 - file_search: the user wants to FIND files, documents, or folders on this computer (finding only, no changes). Set \"query\" to the search terms.\n\
@@ -119,16 +123,38 @@ async fn route_intent(input: String) -> Result<Intent, String> {
 }
 
 // Non-destructive (opens a browser tab), so it skips the confirmation layer.
+// Model-guessed deep links can be wrong: when a fallback is given, the url is
+// checked first and a 404/410 swaps in the fallback. Only those two statuses
+// count as "page doesn't exist" — bot-blocking sites answer 403/999 for pages
+// that load fine in a real browser.
 #[tauri::command]
-fn open_url(app: AppHandle, url: String, browser_path: Option<String>) -> Result<(), String> {
+async fn open_url(
+    app: AppHandle,
+    url: String,
+    browser_path: Option<String>,
+    fallback_url: Option<String>,
+) -> Result<(), String> {
     if !url.starts_with("https://") {
         return Err(format!("refusing non-https url: {url}"));
+    }
+    let mut target = url.clone();
+    if let Some(fallback) = fallback_url.filter(|f| f.starts_with("https://")) {
+        let client = reqwest::Client::new();
+        let status = client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(4))
+            .send()
+            .await
+            .map(|r| r.status().as_u16());
+        if matches!(status, Ok(404 | 410)) {
+            target = fallback;
+        }
     }
     let mut cmd = Command::new("open");
     if let Some(path) = &browser_path {
         cmd.arg("-a").arg(path);
     }
-    cmd.arg(&url).spawn().map_err(|e| e.to_string())?;
+    cmd.arg(&target).spawn().map_err(|e| e.to_string())?;
     hide_bar(app);
     Ok(())
 }

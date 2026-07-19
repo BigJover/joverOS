@@ -113,7 +113,13 @@ function App() {
         // "app" field is ignored (it sometimes holds the site name, e.g.
         // "github", which would resolve to the wrong installed app).
         const browserPath = browserFromInput(input, apps);
-        await invoke("open_url", { url, browserPath });
+        // If a model-guessed page turns out not to exist, land on a Google
+        // search for the user's own words instead of an error page.
+        const fallbackUrl =
+          intent.intent === "web_open"
+            ? "https://www.google.com/search?q=" + encodeURIComponent(input)
+            : null;
+        await invoke("open_url", { url, browserPath, fallbackUrl });
       } else if (intent.intent === "file_search") {
         setReply(`File search isn't wired up yet (coming in M2). Heard: “${intent.query ?? input}”.`);
       } else {

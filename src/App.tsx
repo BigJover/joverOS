@@ -65,11 +65,14 @@ const SITES: Record<string, { host: string; search: string }> = {
   google: { host: "google.com", search: "https://www.google.com/search?q=" },
 };
 
-function siteFromInput(input: string): { site: (typeof SITES)[string]; rest: string } | null {
+function siteFromInput(
+  input: string
+): { name: string; site: (typeof SITES)[string]; rest: string } | null {
   const words = input.trim().split(/\s+/);
-  const site = SITES[words[0].toLowerCase().replace(/[^a-z]/g, "")];
+  const name = words[0].toLowerCase().replace(/[^a-z]/g, "");
+  const site = SITES[name];
   const rest = words.slice(1).join(" ");
-  return site && rest ? { site, rest } : null;
+  return site && rest ? { name, site, rest } : null;
 }
 
 function fuzzyMatch(query: string, apps: AppEntry[]): AppEntry[] {
@@ -86,6 +89,7 @@ function App() {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
   const [thinking, setThinking] = useState(false);
+  const [status, setStatus] = useState("");
   const [reply, setReply] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -95,6 +99,7 @@ function App() {
       setQuery("");
       setSelected(0);
       setThinking(false);
+      setStatus("");
       setReply("");
       invoke<AppEntry[]>("list_apps").then(setApps);
       inputRef.current?.focus();
@@ -111,7 +116,33 @@ function App() {
   const route = async (input: string) => {
     setThinking(true);
     setReply("");
+    setStatus("");
     try {
+      // Browser choice is decided from the raw input only — the model's
+      // "app" field is ignored (it sometimes holds the site name, e.g.
+      // "github", which would resolve to the wrong installed app).
+      const browserPath = browserFromInput(input, apps);
+      const pinned = siteFromInput(input);
+      const siteSearch = pinned
+        ? pinned.site.search + encodeURIComponent(pinned.rest)
+        : null;
+      const google = (q: string) =>
+        "https://www.google.com/search?q=" + encodeURIComponent(q);
+
+      // Learned destination? Opens instantly, no model call. If the page
+      // has died (the fallback got swapped in), unlearn it so the next use
+      // re-resolves fresh.
+      const remembered = await invoke<string | null>("recall_web", { input });
+      if (remembered) {
+        const opened = await invoke<string>("open_url", {
+          url: remembered,
+          browserPath,
+          fallbackUrl: siteSearch ?? google(input),
+        });
+        if (opened !== remembered) await invoke("forget_web", { input });
+        return;
+      }
+
       const intent = await invoke<Intent>("route_intent", { input });
       if (intent.intent === "app_launch" && intent.app) {
         const match = fuzzyMatch(intent.app, apps)[0];
@@ -121,46 +152,64 @@ function App() {
           setReply(`No app called “${intent.app}” here.`);
         }
       } else if (
+        pinned !== null ||
         (intent.intent === "web_open" && intent.url) ||
         (intent.intent === "web_search" && intent.query)
       ) {
-        // Normalize model-produced URLs: force https, no bare domains.
+        // Normalize the model-produced URL: force https, no bare domains.
         const raw = (intent.url ?? "").trim().replace(/^http:\/\//, "");
-        let url =
-          intent.intent === "web_open"
-            ? raw.startsWith("https://")
-              ? raw
-              : "https://" + raw
-            : "https://www.google.com/search?q=" + encodeURIComponent(intent.query!);
-        // "<site> <words>" pins the destination to that site no matter what
-        // the model chose; a bad deep-link guess degrades to the site's own
-        // search, never to Google.
-        const pinned = siteFromInput(input);
+        const modelUrl = raw
+          ? raw.startsWith("https://")
+            ? raw
+            : "https://" + raw
+          : "";
+        let url: string;
         let fallbackUrl: string | null = null;
-        if (pinned) {
-          const siteSearch = pinned.site.search + encodeURIComponent(pinned.rest);
+        let learn: string | null = null;
+
+        if (pinned && siteSearch) {
+          // Destination site is certain. Trust the model only if it gave an
+          // on-site link beyond the bare homepage; otherwise *find* the page
+          // by searching the live web. Worst case is the site's own search —
+          // never a Google detour.
           let onSiteDeepLink = false;
           try {
-            const u = new URL(url);
+            const u = new URL(modelUrl);
             onSiteDeepLink =
               u.hostname.endsWith(pinned.site.host) &&
               (u.pathname !== "/" || u.search !== "");
           } catch {
-            /* unparsable model url — use the site search */
+            /* no usable model url */
           }
           if (onSiteDeepLink) {
-            fallbackUrl = siteSearch;
+            url = modelUrl;
           } else {
-            url = siteSearch;
+            setStatus(`searching ${pinned.name} for ${pinned.rest}…`);
+            url = await invoke<string>("resolve_web", {
+              query: pinned.rest,
+              siteHost: pinned.site.host,
+            }).catch(() => siteSearch);
           }
-        } else if (intent.intent === "web_open") {
-          fallbackUrl = "https://www.google.com/search?q=" + encodeURIComponent(input);
+          learn = url === siteSearch ? null : url;
+          fallbackUrl = siteSearch;
+        } else if (intent.intent === "web_open" && modelUrl) {
+          url = modelUrl;
+          fallbackUrl = google(input);
+          learn = modelUrl;
+        } else {
+          url = google(intent.query ?? input);
         }
-        // Browser choice is decided from the raw input only — the model's
-        // "app" field is ignored (it sometimes holds the site name, e.g.
-        // "github", which would resolve to the wrong installed app).
-        const browserPath = browserFromInput(input, apps);
-        await invoke("open_url", { url, browserPath, fallbackUrl });
+
+        const opened = await invoke<string>("open_url", {
+          url,
+          browserPath,
+          fallbackUrl,
+        });
+        // Only remember pages that opened as intended — a swapped-in
+        // fallback or a search-results page isn't worth learning.
+        if (learn && opened === learn) {
+          await invoke("remember_web", { input, url: opened });
+        }
       } else if (intent.intent === "file_search") {
         setReply(`File search isn't wired up yet (coming in M2). Heard: “${intent.query ?? input}”.`);
       } else {
@@ -218,7 +267,7 @@ function App() {
           ))}
         </ul>
       )}
-      {thinking && <div className="reply thinking">…</div>}
+      {thinking && <div className="reply thinking">{status || "…"}</div>}
       {!thinking && reply && <div className="reply">{reply}</div>}
     </div>
   );

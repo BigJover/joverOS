@@ -122,6 +122,117 @@ async fn route_intent(input: String) -> Result<Intent, String> {
     serde_json::from_str(content).map_err(|e| format!("bad intent JSON: {e}"))
 }
 
+// --- Agent memory (SQLite, per spec) — first table: learned web destinations.
+
+fn mem_db(app: &AppHandle) -> Result<rusqlite::Connection, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let conn = rusqlite::Connection::open(dir.join("memory.db")).map_err(|e| e.to_string())?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS web_memory (
+            input TEXT PRIMARY KEY,
+            url TEXT NOT NULL,
+            hits INTEGER NOT NULL DEFAULT 1,
+            last_used TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(conn)
+}
+
+fn normalize_input(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+#[tauri::command]
+fn recall_web(app: AppHandle, input: String) -> Option<String> {
+    let conn = mem_db(&app).ok()?;
+    let key = normalize_input(&input);
+    let url: Option<String> = conn
+        .query_row("SELECT url FROM web_memory WHERE input = ?1", [&key], |r| r.get(0))
+        .ok();
+    if url.is_some() {
+        let _ = conn.execute(
+            "UPDATE web_memory SET hits = hits + 1, last_used = datetime('now') WHERE input = ?1",
+            [&key],
+        );
+    }
+    url
+}
+
+#[tauri::command]
+fn remember_web(app: AppHandle, input: String, url: String) -> Result<(), String> {
+    let conn = mem_db(&app)?;
+    conn.execute(
+        "INSERT INTO web_memory (input, url) VALUES (?1, ?2)
+         ON CONFLICT(input) DO UPDATE SET url = ?2, last_used = datetime('now')",
+        [&normalize_input(&input), &url],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn forget_web(app: AppHandle, input: String) -> Result<(), String> {
+    let conn = mem_db(&app)?;
+    conn.execute(
+        "DELETE FROM web_memory WHERE input = ?1",
+        [&normalize_input(&input)],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// Find a page by searching the live web (DuckDuckGo HTML — keyless) instead
+// of trusting the model to know the URL. Returns the top result, optionally
+// constrained to one site.
+#[tauri::command]
+async fn resolve_web(query: String, site_host: Option<String>) -> Result<String, String> {
+    let q = match &site_host {
+        Some(host) => format!("site:{host} {query}"),
+        None => query,
+    };
+    let client = reqwest::Client::new();
+    let html = client
+        .get("https://html.duckduckgo.com/html/")
+        .query(&[("q", q.as_str())])
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        )
+        .timeout(std::time::Duration::from_secs(6))
+        .send()
+        .await
+        .map_err(|e| format!("search failed: {e}"))?
+        .text()
+        .await
+        .map_err(|e| e.to_string())?;
+    for chunk in html.split("uddg=").skip(1) {
+        let encoded = chunk.split(&['&', '"'][..]).next().unwrap_or("");
+        let url = urlencoding::decode(encoded).map_err(|e| e.to_string())?.into_owned();
+        if !url.starts_with("https://") {
+            continue;
+        }
+        if let Some(host) = &site_host {
+            let ok = url::host_matches(&url, host);
+            if !ok {
+                continue;
+            }
+        }
+        return Ok(url);
+    }
+    Err("no results".into())
+}
+
+mod url {
+    pub fn host_matches(url: &str, host: &str) -> bool {
+        url.strip_prefix("https://")
+            .and_then(|rest| rest.split('/').next())
+            .is_some_and(|h| h == host || h.ends_with(&format!(".{host}")))
+    }
+}
+
 // Non-destructive (opens a browser tab), so it skips the confirmation layer.
 // Model-guessed deep links can be wrong: when a fallback is given, the url is
 // checked first and a 404/410 swaps in the fallback. Only those two statuses
@@ -133,7 +244,7 @@ async fn open_url(
     url: String,
     browser_path: Option<String>,
     fallback_url: Option<String>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     if !url.starts_with("https://") {
         return Err(format!("refusing non-https url: {url}"));
     }
@@ -156,7 +267,7 @@ async fn open_url(
     }
     cmd.arg(&target).spawn().map_err(|e| e.to_string())?;
     hide_bar(app);
-    Ok(())
+    Ok(target)
 }
 
 #[tauri::command]
@@ -215,7 +326,11 @@ pub fn run() {
             launch_app,
             hide_bar,
             route_intent,
-            open_url
+            open_url,
+            resolve_web,
+            recall_web,
+            remember_web,
+            forget_web
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

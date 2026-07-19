@@ -60,3 +60,18 @@ body {
   background: rgba(255, 255, 255, 0.14);
   color: #ffffff;
 }
+
+.reply {
+  margin-top: 6px;
+  padding: 12px 20px;
+  font-size: 15px;
+  color: #d8d8d8;
+  background: rgba(28, 28, 30, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+}
+
+.reply.thinking {
+  color: rgba(240, 240, 240, 0.45);
+}

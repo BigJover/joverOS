@@ -57,6 +57,62 @@ fn launch_app(app: AppHandle, path: String) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Intent {
+    intent: String,
+    app: Option<String>,
+    query: Option<String>,
+    reply: Option<String>,
+}
+
+const OLLAMA_URL: &str = "http://localhost:11434/api/chat";
+const ROUTER_MODEL: &str = "llama3.1:8b";
+
+const ROUTER_PROMPT: &str = "You route commands for a desktop agent bar. Classify the user's input.\n\
+- app_launch: the user wants to open or launch an application. Set \"app\" to the application name only, nothing else.\n\
+- file_search: the user wants to find files, documents, or folders. Set \"query\" to the search terms.\n\
+- unknown: anything else. Set \"reply\" to one short sentence stating you can't do that yet.\n\
+Respond with JSON only.";
+
+// The schema is enforced by Ollama's structured-output mode, so the model can
+// only ever answer in a shape the frontend knows how to execute.
+#[tauri::command]
+async fn route_intent(input: String) -> Result<Intent, String> {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "intent": { "type": "string", "enum": ["app_launch", "file_search", "unknown"] },
+            "app": { "type": "string" },
+            "query": { "type": "string" },
+            "reply": { "type": "string" }
+        },
+        "required": ["intent"]
+    });
+    let body = serde_json::json!({
+        "model": ROUTER_MODEL,
+        "stream": false,
+        "format": schema,
+        "options": { "temperature": 0 },
+        "messages": [
+            { "role": "system", "content": ROUTER_PROMPT },
+            { "role": "user", "content": input }
+        ]
+    });
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(OLLAMA_URL)
+        .timeout(std::time::Duration::from_secs(60))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("brain offline ({e})"))?;
+    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let content = v["message"]["content"]
+        .as_str()
+        .ok_or_else(|| format!("empty response: {v}"))?;
+    serde_json::from_str(content).map_err(|e| format!("bad intent JSON: {e}"))
+}
+
 #[tauri::command]
 fn hide_bar(app: AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -108,7 +164,12 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_apps, launch_app, hide_bar])
+        .invoke_handler(tauri::generate_handler![
+            list_apps,
+            launch_app,
+            hide_bar,
+            route_intent
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

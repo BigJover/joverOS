@@ -49,6 +49,29 @@ function browserFromInput(input: string, apps: AppEntry[]): string | null {
   return null;
 }
 
+// Sites the bar knows how to search directly. When the input starts with one
+// of these, the destination site is certain regardless of what the model
+// says — worst case is that site's own search page, never a Google detour.
+const SITES: Record<string, { host: string; search: string }> = {
+  youtube: { host: "youtube.com", search: "https://www.youtube.com/results?search_query=" },
+  twitch: { host: "twitch.tv", search: "https://www.twitch.tv/search?term=" },
+  reddit: { host: "reddit.com", search: "https://www.reddit.com/search/?q=" },
+  amazon: { host: "amazon.com", search: "https://www.amazon.com/s?k=" },
+  github: { host: "github.com", search: "https://github.com/search?q=" },
+  linkedin: { host: "linkedin.com", search: "https://www.linkedin.com/search/results/all/?keywords=" },
+  wikipedia: { host: "wikipedia.org", search: "https://en.wikipedia.org/wiki/Special:Search?search=" },
+  steam: { host: "steampowered.com", search: "https://store.steampowered.com/search/?term=" },
+  ebay: { host: "ebay.com", search: "https://www.ebay.com/sch/i.html?_nkw=" },
+  google: { host: "google.com", search: "https://www.google.com/search?q=" },
+};
+
+function siteFromInput(input: string): { site: (typeof SITES)[string]; rest: string } | null {
+  const words = input.trim().split(/\s+/);
+  const site = SITES[words[0].toLowerCase().replace(/[^a-z]/g, "")];
+  const rest = words.slice(1).join(" ");
+  return site && rest ? { site, rest } : null;
+}
+
 function fuzzyMatch(query: string, apps: AppEntry[]): AppEntry[] {
   return apps
     .map((app) => ({ app, s: score(query, app.name) }))
@@ -103,22 +126,40 @@ function App() {
       ) {
         // Normalize model-produced URLs: force https, no bare domains.
         const raw = (intent.url ?? "").trim().replace(/^http:\/\//, "");
-        const url =
+        let url =
           intent.intent === "web_open"
             ? raw.startsWith("https://")
               ? raw
               : "https://" + raw
             : "https://www.google.com/search?q=" + encodeURIComponent(intent.query!);
+        // "<site> <words>" pins the destination to that site no matter what
+        // the model chose; a bad deep-link guess degrades to the site's own
+        // search, never to Google.
+        const pinned = siteFromInput(input);
+        let fallbackUrl: string | null = null;
+        if (pinned) {
+          const siteSearch = pinned.site.search + encodeURIComponent(pinned.rest);
+          let onSiteDeepLink = false;
+          try {
+            const u = new URL(url);
+            onSiteDeepLink =
+              u.hostname.endsWith(pinned.site.host) &&
+              (u.pathname !== "/" || u.search !== "");
+          } catch {
+            /* unparsable model url — use the site search */
+          }
+          if (onSiteDeepLink) {
+            fallbackUrl = siteSearch;
+          } else {
+            url = siteSearch;
+          }
+        } else if (intent.intent === "web_open") {
+          fallbackUrl = "https://www.google.com/search?q=" + encodeURIComponent(input);
+        }
         // Browser choice is decided from the raw input only — the model's
         // "app" field is ignored (it sometimes holds the site name, e.g.
         // "github", which would resolve to the wrong installed app).
         const browserPath = browserFromInput(input, apps);
-        // If a model-guessed page turns out not to exist, land on a Google
-        // search for the user's own words instead of an error page.
-        const fallbackUrl =
-          intent.intent === "web_open"
-            ? "https://www.google.com/search?q=" + encodeURIComponent(input)
-            : null;
         await invoke("open_url", { url, browserPath, fallbackUrl });
       } else if (intent.intent === "file_search") {
         setReply(`File search isn't wired up yet (coming in M2). Heard: “${intent.query ?? input}”.`);

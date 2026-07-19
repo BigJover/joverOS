@@ -69,9 +69,10 @@ const OLLAMA_URL: &str = "http://localhost:11434/api/chat";
 const ROUTER_MODEL: &str = "llama3.1:8b";
 
 const ROUTER_PROMPT: &str = "You route commands for a desktop agent bar. Classify the user's input.\n\
-- app_launch: the user wants to open or launch an application. Set \"app\" to the application name only, nothing else.\n\
-- file_search: the user wants to find files, documents, or folders. Set \"query\" to the search terms.\n\
-- unknown: anything else. Set \"reply\" to one short sentence stating you can't do that yet.\n\
+- app_launch: the user wants to open or launch an already-installed application (NOT install new software). Set \"app\" to the application name only.\n\
+- web_search: the user wants to search the web or look something up. Set \"query\" to the search terms only. If they name a browser (e.g. chrome, safari, firefox), also set \"app\" to that browser's name.\n\
+- file_search: the user wants to FIND files, documents, or folders on this computer (finding only, no changes). Set \"query\" to the search terms.\n\
+- unknown: anything else — including deleting or cleaning up files, emptying trash, changing settings, or installing software. Set \"reply\" to one short sentence stating you can't do that yet.\n\
 Respond with JSON only.";
 
 // The schema is enforced by Ollama's structured-output mode, so the model can
@@ -81,7 +82,7 @@ async fn route_intent(input: String) -> Result<Intent, String> {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
-            "intent": { "type": "string", "enum": ["app_launch", "file_search", "unknown"] },
+            "intent": { "type": "string", "enum": ["app_launch", "web_search", "file_search", "unknown"] },
             "app": { "type": "string" },
             "query": { "type": "string" },
             "reply": { "type": "string" }
@@ -111,6 +112,21 @@ async fn route_intent(input: String) -> Result<Intent, String> {
         .as_str()
         .ok_or_else(|| format!("empty response: {v}"))?;
     serde_json::from_str(content).map_err(|e| format!("bad intent JSON: {e}"))
+}
+
+// Non-destructive (opens a browser tab), so it skips the confirmation layer.
+#[tauri::command]
+fn open_url(app: AppHandle, url: String, browser_path: Option<String>) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err(format!("refusing non-https url: {url}"));
+    }
+    let mut cmd = Command::new("open");
+    if let Some(path) = &browser_path {
+        cmd.arg("-a").arg(path);
+    }
+    cmd.arg(&url).spawn().map_err(|e| e.to_string())?;
+    hide_bar(app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -168,7 +184,8 @@ pub fn run() {
             list_apps,
             launch_app,
             hide_bar,
-            route_intent
+            route_intent,
+            open_url
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

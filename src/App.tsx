@@ -6,7 +6,7 @@ import "./App.css";
 type AppEntry = { name: string; path: string };
 
 type Intent = {
-  intent: "app_launch" | "file_search" | "unknown";
+  intent: "app_launch" | "web_search" | "file_search" | "unknown";
   app?: string;
   query?: string;
   reply?: string;
@@ -25,6 +25,21 @@ function score(query: string, name: string): number {
   }
   if (qi === q.length) return 50 - n.length;
   return -1;
+}
+
+// Deterministic fallback for browser targeting: the router model doesn't
+// reliably fill the "app" field, so scan the raw input ourselves.
+const BROWSERS = ["chrome", "safari", "firefox", "edge", "brave", "arc", "opera", "vivaldi"];
+
+function browserFromInput(input: string, apps: AppEntry[]): string | null {
+  const words = input.toLowerCase().split(/\s+/);
+  for (const b of BROWSERS) {
+    if (words.includes(b)) {
+      const match = fuzzyMatch(b, apps)[0];
+      if (match) return match.path;
+    }
+  }
+  return null;
 }
 
 function fuzzyMatch(query: string, apps: AppEntry[]): AppEntry[] {
@@ -75,6 +90,15 @@ function App() {
         } else {
           setReply(`No app called “${intent.app}” here.`);
         }
+      } else if (intent.intent === "web_search" && intent.query) {
+        const url =
+          "https://www.google.com/search?q=" + encodeURIComponent(intent.query);
+        // If a browser was named, resolve it against installed apps;
+        // otherwise the system default browser handles the URL.
+        const browserPath =
+          (intent.app ? fuzzyMatch(intent.app, apps)[0]?.path : null) ??
+          browserFromInput(input, apps);
+        await invoke("open_url", { url, browserPath });
       } else if (intent.intent === "file_search") {
         setReply(`File search isn't wired up yet (coming in M2). Heard: “${intent.query ?? input}”.`);
       } else {

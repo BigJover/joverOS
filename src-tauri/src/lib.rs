@@ -62,6 +62,7 @@ struct Intent {
     intent: String,
     app: Option<String>,
     query: Option<String>,
+    url: Option<String>,
     reply: Option<String>,
 }
 
@@ -70,7 +71,9 @@ const ROUTER_MODEL: &str = "llama3.1:8b";
 
 const ROUTER_PROMPT: &str = "You route commands for a desktop agent bar. Classify the user's input.\n\
 - app_launch: the user wants to open or launch an already-installed application (NOT install new software). Set \"app\" to the application name only.\n\
-- web_search: the user wants to search the web or look something up. Set \"query\" to the search terms only. If they name a browser (e.g. chrome, safari, firefox), also set \"app\" to that browser's name.\n\
+- web_open: the user names a website, or a site plus a page or section of it (e.g. \"linkedin\", \"linkedin job board\", \"youtube\"). Set \"url\" to the real, well-known https:// URL for that exact page (e.g. https://www.linkedin.com/jobs/). Never invent a URL you are not sure exists — if unsure of the page, use the site's homepage.\n\
+- web_search: the user wants to search the web or look up a question or topic. Set \"query\" to the search terms only.\n\
+For web_open and web_search: if the user names a browser (e.g. chrome, safari, firefox), also set \"app\" to that browser's name.\n\
 - file_search: the user wants to FIND files, documents, or folders on this computer (finding only, no changes). Set \"query\" to the search terms.\n\
 - unknown: anything else — including deleting or cleaning up files, emptying trash, changing settings, or installing software. Set \"reply\" to one short sentence stating you can't do that yet.\n\
 Respond with JSON only.";
@@ -82,9 +85,10 @@ async fn route_intent(input: String) -> Result<Intent, String> {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
-            "intent": { "type": "string", "enum": ["app_launch", "web_search", "file_search", "unknown"] },
+            "intent": { "type": "string", "enum": ["app_launch", "web_open", "web_search", "file_search", "unknown"] },
             "app": { "type": "string" },
             "query": { "type": "string" },
+            "url": { "type": "string" },
             "reply": { "type": "string" }
         },
         "required": ["intent"]

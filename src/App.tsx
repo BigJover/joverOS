@@ -6,9 +6,10 @@ import "./App.css";
 type AppEntry = { name: string; path: string };
 
 type Intent = {
-  intent: "app_launch" | "web_search" | "file_search" | "unknown";
+  intent: "app_launch" | "web_open" | "web_search" | "file_search" | "unknown";
   app?: string;
   query?: string;
+  url?: string;
   reply?: string;
 };
 
@@ -90,13 +91,26 @@ function App() {
         } else {
           setReply(`No app called “${intent.app}” here.`);
         }
-      } else if (intent.intent === "web_search" && intent.query) {
+      } else if (
+        (intent.intent === "web_open" && intent.url) ||
+        (intent.intent === "web_search" && intent.query)
+      ) {
+        // Normalize model-produced URLs: force https, no bare domains.
+        const raw = (intent.url ?? "").trim().replace(/^http:\/\//, "");
         const url =
-          "https://www.google.com/search?q=" + encodeURIComponent(intent.query);
+          intent.intent === "web_open"
+            ? raw.startsWith("https://")
+              ? raw
+              : "https://" + raw
+            : "https://www.google.com/search?q=" + encodeURIComponent(intent.query!);
         // If a browser was named, resolve it against installed apps;
-        // otherwise the system default browser handles the URL.
+        // otherwise the system default browser handles the URL. The model
+        // sometimes puts the *site* name in "app" (e.g. "github"), so only
+        // trust it when it names an actual browser.
+        const appIsBrowser =
+          intent.app && BROWSERS.some((b) => intent.app!.toLowerCase().includes(b));
         const browserPath =
-          (intent.app ? fuzzyMatch(intent.app, apps)[0]?.path : null) ??
+          (appIsBrowser ? fuzzyMatch(intent.app!, apps)[0]?.path : null) ??
           browserFromInput(input, apps);
         await invoke("open_url", { url, browserPath });
       } else if (intent.intent === "file_search") {

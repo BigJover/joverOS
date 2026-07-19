@@ -28,14 +28,20 @@ function score(query: string, name: string): number {
   return -1;
 }
 
-// Deterministic fallback for browser targeting: the router model doesn't
-// reliably fill the "app" field, so scan the raw input ourselves.
+// Deterministic browser targeting (the model is unreliable here): default
+// browser always, unless the input *specifies* one — browser name as the
+// first word ("chrome search turtles") or after in/with/using/on ("search
+// turtles in firefox"). A browser word mid-query ("safari park tickets")
+// is part of the query, not a target.
 const BROWSERS = ["chrome", "safari", "firefox", "edge", "brave", "arc", "opera", "vivaldi"];
+const TARGET_PREPS = ["in", "with", "using", "on"];
 
 function browserFromInput(input: string, apps: AppEntry[]): string | null {
   const words = input.toLowerCase().split(/\s+/);
   for (const b of BROWSERS) {
-    if (words.includes(b)) {
+    const i = words.indexOf(b);
+    const specified = i === 0 || (i > 0 && TARGET_PREPS.includes(words[i - 1]));
+    if (specified) {
       const match = fuzzyMatch(b, apps)[0];
       if (match) return match.path;
     }
@@ -103,15 +109,10 @@ function App() {
               ? raw
               : "https://" + raw
             : "https://www.google.com/search?q=" + encodeURIComponent(intent.query!);
-        // If a browser was named, resolve it against installed apps;
-        // otherwise the system default browser handles the URL. The model
-        // sometimes puts the *site* name in "app" (e.g. "github"), so only
-        // trust it when it names an actual browser.
-        const appIsBrowser =
-          intent.app && BROWSERS.some((b) => intent.app!.toLowerCase().includes(b));
-        const browserPath =
-          (appIsBrowser ? fuzzyMatch(intent.app!, apps)[0]?.path : null) ??
-          browserFromInput(input, apps);
+        // Browser choice is decided from the raw input only — the model's
+        // "app" field is ignored (it sometimes holds the site name, e.g.
+        // "github", which would resolve to the wrong installed app).
+        const browserPath = browserFromInput(input, apps);
         await invoke("open_url", { url, browserPath });
       } else if (intent.intent === "file_search") {
         setReply(`File search isn't wired up yet (coming in M2). Heard: “${intent.query ?? input}”.`);

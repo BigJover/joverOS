@@ -1,4 +1,4 @@
-# Project: AI-Native OS (working title)
+# Project: joverOS
 
 ## What this is
 
@@ -106,7 +106,6 @@ compatibility, install to correct profile, launch. Confirmation before any downl
 
 ## Open questions (not yet decided — raise when relevant)
 
-- Name for the OS/product.
 - Open-source or not.
 - Distro base: Arch vs. Fedora Atomic vs. NixOS.
 - Results UI details: how the bar expands, progress for long jobs, notification behavior.

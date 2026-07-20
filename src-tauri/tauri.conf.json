@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "ai-os",
+  "productName": "joverOS",
   "version": "0.1.0",
-  "identifier": "com.jovankirovski.ai-os",
+  "identifier": "com.jovankirovski.joveros",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "ai-os",
+        "title": "joverOS",
         "width": 640,
         "height": 420,
         "center": true,

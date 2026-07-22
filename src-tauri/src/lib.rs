@@ -141,28 +141,55 @@ fn mdfind(args: &[&str]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+// caches, dependencies, dotfolders — machinery, not the user's files
+fn noise(p: &str) -> bool {
+    p.contains("/Library/") || p.contains("/node_modules/") || p.contains("/.")
+}
+
+fn add_hits(list: Vec<String>, paths: &mut Vec<String>) {
+    for p in list {
+        if paths.len() >= 8 {
+            return;
+        }
+        if !noise(&p) && !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+}
+
 #[tauri::command]
 fn search_files(query: String) -> Vec<FileHit> {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut paths: Vec<String> = Vec::new();
-    // Name matches first (usually what's meant), content matches fill the rest.
-    for list in [
-        mdfind(&["-onlyin", &home, "-name", &query]),
-        mdfind(&["-onlyin", &home, &query]),
-    ] {
-        for p in list {
-            // caches, dependencies, dotfolders — machinery, not the user's files
-            if p.contains("/Library/") || p.contains("/node_modules/") || p.contains("/.") {
-                continue;
-            }
-            if paths.len() >= 8 {
-                break;
-            }
-            if !paths.contains(&p) {
-                paths.push(p);
+
+    // Exact phrase in the name beats everything.
+    add_hits(mdfind(&["-onlyin", &home, "-name", &query]), &mut paths);
+
+    // People don't name things the way they ask for them: "spring break
+    // pictures" must still find a folder called "spring break". Each query
+    // word searches names on its own; results rank by how many words hit,
+    // and a single shared word isn't enough to count.
+    let words: Vec<&str> = query.split_whitespace().filter(|w| w.len() > 2).collect();
+    if words.len() > 1 {
+        let mut scored: Vec<(String, usize)> = Vec::new();
+        for w in &words {
+            for p in mdfind(&["-onlyin", &home, "-name", w]) {
+                if noise(&p) {
+                    continue;
+                }
+                match scored.iter_mut().find(|(sp, _)| sp == &p) {
+                    Some((_, n)) => *n += 1,
+                    None => scored.push((p, 1)),
+                }
             }
         }
+        scored.retain(|(_, n)| *n >= 2);
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        add_hits(scored.into_iter().map(|(p, _)| p).collect(), &mut paths);
     }
+
+    // Content matches fill whatever room is left.
+    add_hits(mdfind(&["-onlyin", &home, &query]), &mut paths);
     paths
         .into_iter()
         .map(|p| FileHit {

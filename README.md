@@ -1,18 +1,61 @@
 # joverOS
 
-The agent-first OS. A natural-language bar that launches apps, opens and finds
-web destinations, and (soon) searches and organizes files — built as a
-cross-platform Tauri app that will become the desktop shell of a custom Linux
-distro. See CLAUDE.md for the full spec and milestone ladder.
+**The agent-first OS.** One text bar, summoned from anywhere with `⌥ Space`, that does what you mean: launches your apps, takes you straight to pages on the web — and learns your destinations as you use it. All routing runs on a **local LLM**; nothing leaves your machine, no API keys, works offline.
 
-## Dev
+Today it's a macOS launcher bar. The plan is bigger: this app becomes the desktop shell of a custom Linux distro that boots straight into the bar — an OS anyone can use, where the agent replaces the terminal, the settings maze, and the call to a tech-savvy relative.
 
-Requires [Ollama](https://ollama.com) running with `llama3.1:8b` pulled
-(the bar reports "brain offline" without it).
+## What it does right now (v0.1 — milestone M1)
+
+- **Launch apps by name** — instant fuzzy matching as you type, no LLM in the loop (`obs`, `open the calculator`)
+- **Go anywhere on the web by intent** —
+  - `youtube` → homepage, `linkedin job board` → the jobs page
+  - `youtube mr beast` → the channel itself, not a search detour
+  - `amazon airpods` → Amazon's own search results
+  - `chrome search turtles` → your search, in the browser you named (default browser otherwise — always)
+- **Find, don't know** — for pages the model can't know, the bar searches the live web (DuckDuckGo, keyless) scoped to the site you named, and opens the top real result. Worst case is the site's own search page, never a Google detour.
+- **Learned web memory** — destinations that worked are remembered in a local SQLite database and open instantly next time, zero model calls. Pages that die (404) are automatically unlearned and re-resolved fresh.
+- **Honest refusals** — anything it can't safely do yet ("delete my files", "change my settings") gets a terse "can't do that yet", not a guess. Destructive abilities arrive only behind an explicit confirmation layer.
+
+## Install (macOS)
+
+1. Grab the `.dmg` from [Releases](../../releases) and drag **joverOS** to Applications.
+2. Install [Ollama](https://ollama.com), then pull the brain: `ollama pull llama3.1:8b`. Keep Ollama running (menu-bar app) — without it the bar still launches apps, but web intents report "brain offline".
+3. First launch: the app is unsigned, so **right-click → Open** and confirm the Gatekeeper prompt.
+4. Press **⌥ Space** and type.
+
+## Build from source
 
 ```
+git clone https://github.com/BigJover/joverOS
+cd joverOS
 npm install
-npm run tauri dev
+npm run tauri dev     # dev build
+npm run tauri build   # produces the .dmg
 ```
 
-Summon the bar with **Option+Space**.
+Requires Node, Rust (rustup), and Ollama with `llama3.1:8b`.
+
+## How it's built
+
+Tauri 2 (Rust backend, React + TypeScript frontend). Three-tier design that keeps a local 8B model on small decisions and lets deterministic code do the work:
+
+1. **Instant tier** — fuzzy app matching in the frontend, no model.
+2. **Router tier** — one structured-output call to Ollama classifies input into a fixed intent schema (`app_launch` / `web_open` / `web_search` / `file_search` / `unknown`). The model can only answer in shapes the app knows how to execute — never freeform prose driving execution.
+3. **Tool tier** — real code per intent: live-web resolver, HTTPS-only opener with 404-fallback, SQLite memory (`recall` / `remember` / `forget`).
+
+## Roadmap
+
+| Milestone | | |
+|---|---|---|
+| M0 | Summonable bar, fuzzy app launch | ✅ |
+| M1 | Local-LLM intent router + full web stack + learned memory | ✅ |
+| M2 | File search & organization with permission prompts + undo log | ⏳ next |
+| M3 | Troubleshooting domains (wifi, slow machine, audio), history view, scoped permissions | |
+| M4 | Workflows — save and restore whole working sessions | |
+| M5 | Linux, then the distro: the bar becomes the desktop shell | |
+
+Full spec and product principles in [CLAUDE.md](CLAUDE.md).
+
+---
+
+Built by [Jovan Kirovski](https://github.com/BigJover).

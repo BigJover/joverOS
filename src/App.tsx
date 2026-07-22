@@ -248,7 +248,16 @@ function App() {
       } else if (intent.intent === "file_search") {
         const q = (intent.query ?? input).trim();
         setStatus(`searching files for ${q}…`);
-        const hits = await invoke<FileHit[]>("search_files", { query: q });
+        let hits = await invoke<FileHit[]>("search_files", { query: q });
+        if (hits.length > 8) {
+          setStatus(`narrowing ${hits.length} matches…`);
+          const order = await invoke<number[]>("rerank_files", {
+            query: q,
+            files: hits,
+          }).catch(() => [] as number[]);
+          if (order.length > 0) hits = order.map((i) => hits[i]);
+        }
+        hits = hits.slice(0, 8);
         if (hits.length > 0) {
           setFiles(hits);
           setSelected(0);

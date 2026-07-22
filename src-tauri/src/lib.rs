@@ -82,8 +82,34 @@ For web_open and web_search: if the user names a browser (e.g. chrome, safari, f
 - unknown: anything else — including deleting or cleaning up files, emptying trash, changing settings, or installing software. Set \"reply\" to one short sentence stating you can't do that yet.\n\
 Respond with JSON only.";
 
-// The schema is enforced by Ollama's structured-output mode, so the model can
-// only ever answer in a shape the frontend knows how to execute.
+// One structured-output call to the local model: the schema means it can
+// only ever answer in a shape the caller knows how to execute.
+async fn ollama_json(system: &str, user: &str, schema: serde_json::Value) -> Result<String, String> {
+    let body = serde_json::json!({
+        "model": ROUTER_MODEL,
+        "stream": false,
+        "format": schema,
+        "options": { "temperature": 0 },
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user }
+        ]
+    });
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(OLLAMA_URL)
+        .timeout(std::time::Duration::from_secs(60))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("brain offline ({e})"))?;
+    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    v["message"]["content"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("empty response: {v}"))
+}
+
 #[tauri::command]
 async fn route_intent(input: String) -> Result<Intent, String> {
     let schema = serde_json::json!({
@@ -97,29 +123,8 @@ async fn route_intent(input: String) -> Result<Intent, String> {
         },
         "required": ["intent"]
     });
-    let body = serde_json::json!({
-        "model": ROUTER_MODEL,
-        "stream": false,
-        "format": schema,
-        "options": { "temperature": 0 },
-        "messages": [
-            { "role": "system", "content": ROUTER_PROMPT },
-            { "role": "user", "content": input }
-        ]
-    });
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(OLLAMA_URL)
-        .timeout(std::time::Duration::from_secs(60))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("brain offline ({e})"))?;
-    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let content = v["message"]["content"]
-        .as_str()
-        .ok_or_else(|| format!("empty response: {v}"))?;
-    serde_json::from_str(content).map_err(|e| format!("bad intent JSON: {e}"))
+    let content = ollama_json(ROUTER_PROMPT, &input, schema).await?;
+    serde_json::from_str(&content).map_err(|e| format!("bad intent JSON: {e}"))
 }
 
 // --- File search (M2). Spotlight IS the local file index on macOS; the Linux
@@ -127,7 +132,7 @@ async fn route_intent(input: String) -> Result<Intent, String> {
 // permission prompt, opening is user-initiated, and changes will only ever
 // come through the confirmation layer.
 
-#[derive(serde::Serialize, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct FileHit {
     name: String,
     path: String,
@@ -146,9 +151,9 @@ fn noise(p: &str) -> bool {
     p.contains("/Library/") || p.contains("/node_modules/") || p.contains("/.")
 }
 
-fn add_hits(list: Vec<String>, paths: &mut Vec<String>) {
+fn add_hits(list: Vec<String>, paths: &mut Vec<String>, cap: usize) {
     for p in list {
-        if paths.len() >= 8 {
+        if paths.len() >= cap {
             return;
         }
         if !noise(&p) && !paths.contains(&p) {
@@ -161,9 +166,20 @@ fn add_hits(list: Vec<String>, paths: &mut Vec<String>) {
 fn search_files(query: String) -> Vec<FileHit> {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut paths: Vec<String> = Vec::new();
+    // Overshoot the visible 8: the surplus feeds the reranker when needed.
+    let cap = 24;
 
-    // Exact phrase in the name beats everything.
-    add_hits(mdfind(&["-onlyin", &home, "-name", &query]), &mut paths);
+    // Exact phrase in the name beats everything. Stems too, so "resumes"
+    // still finds Resume.pdf.
+    let stemmed: String = query
+        .split_whitespace()
+        .map(|w| w.trim_end_matches('s'))
+        .collect::<Vec<_>>()
+        .join(" ");
+    add_hits(mdfind(&["-onlyin", &home, "-name", &query]), &mut paths, cap);
+    if stemmed != query {
+        add_hits(mdfind(&["-onlyin", &home, "-name", &stemmed]), &mut paths, cap);
+    }
 
     // People don't name things the way they ask for them: "spring break
     // pictures" must still find a folder called "spring break". Each query
@@ -173,7 +189,7 @@ fn search_files(query: String) -> Vec<FileHit> {
     if words.len() > 1 {
         let mut scored: Vec<(String, usize)> = Vec::new();
         for w in &words {
-            for p in mdfind(&["-onlyin", &home, "-name", w]) {
+            for p in mdfind(&["-onlyin", &home, "-name", w.trim_end_matches('s')]) {
                 if noise(&p) {
                     continue;
                 }
@@ -185,11 +201,16 @@ fn search_files(query: String) -> Vec<FileHit> {
         }
         scored.retain(|(_, n)| *n >= 2);
         scored.sort_by(|a, b| b.1.cmp(&a.1));
-        add_hits(scored.into_iter().map(|(p, _)| p).collect(), &mut paths);
+        add_hits(scored.into_iter().map(|(p, _)| p).collect(), &mut paths, cap);
     }
 
-    // Content matches fill whatever room is left.
-    add_hits(mdfind(&["-onlyin", &home, &query]), &mut paths);
+    // Content matches fill whatever room is left — documents only, since
+    // "contains the word" is meaningless for code, caches, and binaries.
+    add_hits(
+        mdfind(&["-onlyin", &home, &format!("{stemmed} kind:document")]),
+        &mut paths,
+        cap,
+    );
     paths
         .into_iter()
         .map(|p| FileHit {
@@ -200,6 +221,38 @@ fn search_files(query: String) -> Vec<FileHit> {
             path: p,
         })
         .collect()
+}
+
+// Too many hits? One model call judges which candidates ARE the thing
+// asked for (by name, folder, type) vs merely mention it. Paths only —
+// Spotlight's index already did the content reading, and extracting text
+// from files at search time would blow the latency budget.
+#[tauri::command]
+async fn rerank_files(query: String, files: Vec<FileHit>) -> Result<Vec<usize>, String> {
+    let listing = files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| format!("{i}: {}", f.path))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": { "matches": { "type": "array", "items": { "type": "integer" } } },
+        "required": ["matches"]
+    });
+    let system = "You filter file-search results on the user's own computer. From the numbered candidate paths, return the indices of files that genuinely ARE what the user asked for, best match first, at most 8. Judge by file name, folder, and file type. Exclude files that merely mention the topic. Respond with JSON only.";
+    let user = format!("Searched for: {query}\n\nCandidates:\n{listing}");
+    let content = ollama_json(system, &user, schema).await?;
+    let v: serde_json::Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+    Ok(v["matches"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_u64().map(|n| n as usize))
+                .filter(|n| *n < files.len())
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 // --- Agent memory (SQLite, per spec) — first table: learned web destinations.
@@ -407,6 +460,7 @@ pub fn run() {
             hide_bar,
             route_intent,
             search_files,
+            rerank_files,
             open_url,
             resolve_web,
             recall_web,

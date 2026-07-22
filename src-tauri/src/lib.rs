@@ -79,7 +79,8 @@ const ROUTER_PROMPT: &str = "You route commands for a desktop agent bar. Classif
 - web_search: the user wants to search the web or look up a question or topic. Set \"query\" to the search terms only.\n\
 For web_open and web_search: if the user names a browser (e.g. chrome, safari, firefox), also set \"app\" to that browser's name.\n\
 - file_search: the user wants to FIND files, documents, or folders on this computer (finding only, no changes). Set \"query\" to only the words likely in the file's name or contents — drop filler like \"find\", \"my\", \"that\", \"file\".\n\
-- unknown: anything else — including deleting or cleaning up files, emptying trash, changing settings, or installing software. Set \"reply\" to one short sentence stating you can't do that yet.\n\
+- file_organize: the user wants to tidy/organize/sort a folder's files into subfolders (moving only, never deleting). Set \"query\" to the folder name (e.g. downloads, desktop).\n\
+- unknown: anything else — including deleting files, emptying trash, changing settings, or installing software. Set \"reply\" to one short sentence stating you can't do that yet.\n\
 Respond with JSON only.";
 
 // One structured-output call to the local model: the schema means it can
@@ -115,7 +116,7 @@ async fn route_intent(input: String) -> Result<Intent, String> {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
-            "intent": { "type": "string", "enum": ["app_launch", "web_open", "web_search", "file_search", "unknown"] },
+            "intent": { "type": "string", "enum": ["app_launch", "web_open", "web_search", "file_search", "file_organize", "unknown"] },
             "app": { "type": "string" },
             "query": { "type": "string" },
             "url": { "type": "string" },
@@ -255,12 +256,202 @@ async fn rerank_files(query: String, files: Vec<FileHit>) -> Result<Vec<usize>, 
         .unwrap_or_default())
 }
 
+// --- File organization (M2): plan -> confirm -> apply, every move logged in
+// SQLite and reversible with "undo". Moving only, never deleting — the undo
+// log is the trust feature that makes the bar safe to say yes to.
+
+const CATEGORIES: &[(&str, &[&str])] = &[
+    ("Images", &["png", "jpg", "jpeg", "gif", "heic", "webp", "svg", "tiff", "bmp"]),
+    ("Videos", &["mp4", "mov", "avi", "mkv", "webm"]),
+    ("Music", &["mp3", "wav", "m4a", "flac", "aac", "ogg"]),
+    ("Documents", &["pdf", "doc", "docx", "txt", "rtf", "md", "pages", "xls", "xlsx", "numbers", "ppt", "pptx", "key", "csv", "epub"]),
+    ("Archives", &["zip", "rar", "7z", "tar", "gz"]),
+    ("Installers", &["dmg", "pkg"]),
+    ("Code", &["js", "ts", "tsx", "py", "rs", "go", "java", "c", "cpp", "h", "html", "css", "json", "sh"]),
+];
+
+fn category_of(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    for (cat, exts) in CATEGORIES {
+        if exts.contains(&ext.as_str()) {
+            return cat;
+        }
+    }
+    "Other"
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct PlannedMove {
+    from: String,
+    to: String,
+}
+
+#[derive(serde::Serialize)]
+struct OrganizePlan {
+    summary: String,
+    moves: Vec<PlannedMove>,
+}
+
+#[tauri::command]
+fn plan_organize(folder: String) -> Result<OrganizePlan, String> {
+    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+    let hint = folder.to_lowercase();
+    let name = if hint.contains("download") {
+        "Downloads"
+    } else if hint.contains("desktop") {
+        "Desktop"
+    } else if hint.contains("document") {
+        "Documents"
+    } else {
+        return Err("I can organize Downloads, Desktop, or Documents for now.".into());
+    };
+    let dir = Path::new(&home).join(name);
+    let mut moves = Vec::new();
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())?.flatten() {
+        let path = entry.path();
+        let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // loose files only — folders stay where the user put them
+        if fname.starts_with('.') || !path.is_file() {
+            continue;
+        }
+        let cat = category_of(&path);
+        match counts.iter_mut().find(|(c, _)| *c == cat) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((cat, 1)),
+        }
+        moves.push(PlannedMove {
+            from: path.to_string_lossy().into_owned(),
+            to: dir.join(cat).join(fname).to_string_lossy().into_owned(),
+        });
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    let breakdown = counts
+        .iter()
+        .map(|(c, n)| format!("{c} {n}"))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    Ok(OrganizePlan {
+        summary: format!("{name}: {} loose files → {breakdown}", moves.len()),
+        moves,
+    })
+}
+
+#[tauri::command]
+fn apply_organize(app: AppHandle, moves: Vec<PlannedMove>) -> Result<String, String> {
+    let conn = mem_db(&app)?;
+    let batch: i64 = conn
+        .query_row("SELECT COALESCE(MAX(batch), 0) + 1 FROM file_ops", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    let mut done = 0usize;
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    for m in &moves {
+        let from = Path::new(&m.from);
+        if !from.is_file() {
+            continue; // changed since the plan was shown — skip, never guess
+        }
+        let mut to = std::path::PathBuf::from(&m.to);
+        let parent = to.parent().map(|p| p.to_path_buf()).ok_or("bad destination")?;
+        std::fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
+        // never overwrite: a name collision gets " 2", " 3", …
+        if to.exists() {
+            let stem = to.file_stem().and_then(|x| x.to_str()).unwrap_or("file").to_string();
+            let ext = to
+                .extension()
+                .and_then(|x| x.to_str())
+                .map(|e| format!(".{e}"))
+                .unwrap_or_default();
+            let mut n = 2;
+            while to.exists() {
+                to = parent.join(format!("{stem} {n}{ext}"));
+                n += 1;
+            }
+        }
+        std::fs::rename(from, &to).map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO file_ops (batch, src, dst) VALUES (?1, ?2, ?3)",
+            rusqlite::params![batch, m.from, to.to_string_lossy()],
+        )
+        .map_err(|e| e.to_string())?;
+        if !dirs.contains(&parent) {
+            dirs.push(parent);
+        }
+        done += 1;
+    }
+    if done == 0 {
+        return Ok("Nothing to move.".into());
+    }
+    Ok(format!(
+        "Moved {done} files into {} folders. Type undo to reverse.",
+        dirs.len()
+    ))
+}
+
+#[tauri::command]
+fn undo_last(app: AppHandle) -> Result<String, String> {
+    let conn = mem_db(&app)?;
+    let batch: Option<i64> = conn
+        .query_row("SELECT MAX(batch) FROM file_ops", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    let Some(batch) = batch else {
+        return Ok("Nothing to undo.".into());
+    };
+    let rows: Vec<(String, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT src, dst FROM file_ops WHERE batch = ?1 ORDER BY id DESC")
+            .map_err(|e| e.to_string())?;
+        let r = stmt
+            .query_map([batch], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
+        r
+    };
+    let mut back = 0usize;
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    for (src, dst) in &rows {
+        let (s, d) = (Path::new(src), Path::new(dst));
+        if d.is_file() && !s.exists() && std::fs::rename(d, s).is_ok() {
+            back += 1;
+            if let Some(p) = d.parent() {
+                if !dirs.contains(&p.to_path_buf()) {
+                    dirs.push(p.to_path_buf());
+                }
+            }
+        }
+    }
+    conn.execute("DELETE FROM file_ops WHERE batch = ?1", [batch])
+        .map_err(|e| e.to_string())?;
+    // category folders the undo emptied get cleaned up; occupied ones stay
+    for dir in dirs {
+        let _ = std::fs::remove_dir(&dir);
+    }
+    Ok(format!("Put {back} files back."))
+}
+
 // --- Agent memory (SQLite, per spec) — first table: learned web destinations.
 
 fn mem_db(app: &AppHandle) -> Result<rusqlite::Connection, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let conn = rusqlite::Connection::open(dir.join("memory.db")).map_err(|e| e.to_string())?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS file_ops (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch INTEGER NOT NULL,
+            src TEXT NOT NULL,
+            dst TEXT NOT NULL,
+            ts TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS web_memory (
             input TEXT PRIMARY KEY,
@@ -461,6 +652,9 @@ pub fn run() {
             route_intent,
             search_files,
             rerank_files,
+            plan_organize,
+            apply_organize,
+            undo_last,
             open_url,
             resolve_web,
             recall_web,

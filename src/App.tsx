@@ -7,8 +7,11 @@ type AppEntry = { name: string; path: string };
 
 type FileHit = { name: string; path: string };
 
+type PlannedMove = { from: string; to: string };
+type OrganizePlan = { summary: string; moves: PlannedMove[] };
+
 type Intent = {
-  intent: "app_launch" | "web_open" | "web_search" | "file_search" | "unknown";
+  intent: "app_launch" | "web_open" | "web_search" | "file_search" | "file_organize" | "unknown";
   app?: string;
   query?: string;
   url?: string;
@@ -85,6 +88,7 @@ const VERB_PINS: { verbs: string[]; intent: Intent["intent"] }[] = [
   { verbs: ["find", "where is", "wheres", "locate"], intent: "file_search" },
   { verbs: ["search for", "search", "look up", "lookup"], intent: "web_search" },
   { verbs: ["launch", "open app"], intent: "app_launch" },
+  { verbs: ["organize", "tidy", "clean up", "sort"], intent: "file_organize" },
 ];
 
 function verbPin(input: string): Intent | null {
@@ -122,6 +126,7 @@ function App() {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
   const [files, setFiles] = useState<FileHit[]>([]);
+  const [plan, setPlan] = useState<OrganizePlan | null>(null);
   const [thinking, setThinking] = useState(false);
   const [status, setStatus] = useState("");
   const [reply, setReply] = useState("");
@@ -133,6 +138,7 @@ function App() {
       setQuery("");
       setSelected(0);
       setFiles([]);
+      setPlan(null);
       setThinking(false);
       setStatus("");
       setReply("");
@@ -153,6 +159,12 @@ function App() {
     setReply("");
     setStatus("");
     try {
+      // "undo" is a reserved word: straight to the log, no model.
+      if (input.trim().toLowerCase() === "undo") {
+        setReply(await invoke<string>("undo_last"));
+        return;
+      }
+
       // Browser choice is decided from the raw input only — the model's
       // "app" field is ignored (it sometimes holds the site name, e.g.
       // "github", which would resolve to the wrong installed app).
@@ -245,6 +257,16 @@ function App() {
         if (learn && opened === learn) {
           await invoke("remember_web", { input, url: opened });
         }
+      } else if (intent.intent === "file_organize") {
+        const p = await invoke<OrganizePlan>("plan_organize", {
+          folder: intent.query ?? input,
+        });
+        if (p.moves.length === 0) {
+          setReply("Nothing loose to organize there.");
+        } else {
+          setPlan(p);
+          setReply(`${p.summary} — Enter to do it, Esc to cancel.`);
+        }
       } else if (intent.intent === "file_search") {
         const q = (intent.query ?? input).trim();
         setStatus(`searching files for ${q}…`);
@@ -275,6 +297,21 @@ function App() {
   };
 
   const onKeyDown = (e: React.KeyboardEvent) => {
+    // A pending plan owns the keyboard: nothing moves without Enter here.
+    if (plan) {
+      if (e.key === "Enter") {
+        const moves = plan.moves;
+        setPlan(null);
+        setReply("working…");
+        invoke<string>("apply_organize", { moves })
+          .then(setReply)
+          .catch((err) => setReply(String(err)));
+      } else if (e.key === "Escape") {
+        setPlan(null);
+        setReply("Cancelled — nothing moved.");
+      }
+      return;
+    }
     if (e.key === "Escape") {
       invoke("hide_bar");
     } else if (e.key === "ArrowDown") {
@@ -306,6 +343,7 @@ function App() {
           setQuery(e.target.value);
           setSelected(0);
           setFiles([]);
+          setPlan(null);
           setReply("");
         }}
       />

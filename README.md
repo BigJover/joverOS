@@ -14,6 +14,7 @@ Today it's a macOS launcher bar. The plan is bigger: this app becomes the deskto
   - `chrome search turtles` → your search, in the browser you named (default browser otherwise — always)
 - **Find, don't know** — for pages the model can't know, the bar searches the live web (DuckDuckGo, keyless) scoped to the site you named, and opens the top real result. Worst case is the site's own search page, never a Google detour.
 - **Learned web memory** — destinations that worked are remembered in a local SQLite database and open instantly next time, zero model calls. Pages that die (404) are automatically unlearned and re-resolved fresh.
+- **Organize with a paper trail** — "organize my downloads" plans the moves, shows you the plan, and touches nothing until you confirm. Every move is logged to SQLite; `undo` puts everything back.
 - **Honest refusals** — anything it can't safely do yet ("delete my files", "change my settings") gets a terse "can't do that yet", not a guess. Destructive abilities arrive only behind an explicit confirmation layer.
 
 ## Shortcuts — the bar's command vocabulary
@@ -27,6 +28,8 @@ Certain first words pin what happens, deterministically — no model, no guessin
 | `launch …` | open **an app** |
 | `youtube …`, `reddit …`, `amazon …`, … | go to / search **that site** |
 | `chrome …` / `firefox …` / `safari …` first word, or `… in firefox` | use **that browser** |
+| `organize downloads` / `tidy desktop` | plan a **by-type cleanup**, shown first — nothing moves until you press Enter |
+| `undo` | **reverse** the last file operation |
 
 Everything else is free-form — the local model figures out what you meant.
 

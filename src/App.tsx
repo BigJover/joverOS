@@ -77,6 +77,37 @@ function siteFromInput(
   return site && rest ? { name, site, rest } : null;
 }
 
+// Verb shortcuts: leading command words that pin the intent outright — a
+// small vocabulary the user can rely on, instant and misroute-proof (no
+// model call). Free-form phrasing still falls through to the router.
+// Contract: find = files, search = web, launch = apps. No overlaps.
+const VERB_PINS: { verbs: string[]; intent: Intent["intent"] }[] = [
+  { verbs: ["find", "where is", "wheres", "locate"], intent: "file_search" },
+  { verbs: ["search for", "search", "look up", "lookup"], intent: "web_search" },
+  { verbs: ["launch", "open app"], intent: "app_launch" },
+];
+
+function verbPin(input: string): Intent | null {
+  const lower = input.toLowerCase();
+  for (const { verbs, intent } of VERB_PINS) {
+    for (const v of verbs) {
+      if (!lower.startsWith(v + " ")) continue;
+      let rest = input.slice(v.length + 1).trim();
+      if (intent === "file_search") rest = rest.replace(/^(my|the)\s+/i, "");
+      if (intent === "app_launch") return { intent, app: rest };
+      return { intent, query: rest };
+    }
+  }
+  return null;
+}
+
+// "search turtles in firefox" — the browser tail is targeting, not query.
+const stripBrowserTail = (q: string) =>
+  q.replace(
+    new RegExp(`\\s+(?:${TARGET_PREPS.join("|")})\\s+(?:${BROWSERS.join("|")})\\s*$`, "i"),
+    ""
+  );
+
 function fuzzyMatch(query: string, apps: AppEntry[]): AppEntry[] {
   return apps
     .map((app) => ({ app, s: score(query, app.name) }))
@@ -147,7 +178,7 @@ function App() {
         return;
       }
 
-      const intent = await invoke<Intent>("route_intent", { input });
+      const intent = verbPin(input) ?? (await invoke<Intent>("route_intent", { input }));
       if (intent.intent === "app_launch" && intent.app) {
         const match = fuzzyMatch(intent.app, apps)[0];
         if (match) {
@@ -201,7 +232,7 @@ function App() {
           fallbackUrl = google(input);
           learn = modelUrl;
         } else {
-          url = google(intent.query ?? input);
+          url = google(stripBrowserTail(intent.query ?? input));
         }
 
         const opened = await invoke<string>("open_url", {

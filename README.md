@@ -16,6 +16,20 @@ Today it's a macOS launcher bar. The plan is bigger: this app becomes the deskto
 - **Learned web memory** — destinations that worked are remembered in a local SQLite database and open instantly next time, zero model calls. Pages that die (404) are automatically unlearned and re-resolved fresh.
 - **Honest refusals** — anything it can't safely do yet ("delete my files", "change my settings") gets a terse "can't do that yet", not a guess. Destructive abilities arrive only behind an explicit confirmation layer.
 
+## Shortcuts — the bar's command vocabulary
+
+Certain first words pin what happens, deterministically — no model, no guessing, instant:
+
+| You type | It always means |
+|---|---|
+| `find …` / `where is …` / `locate …` | search **your files** |
+| `search …` / `look up …` | search **the web** |
+| `launch …` | open **an app** |
+| `youtube …`, `reddit …`, `amazon …`, … | go to / search **that site** |
+| `chrome …` / `firefox …` / `safari …` first word, or `… in firefox` | use **that browser** |
+
+Everything else is free-form — the local model figures out what you meant.
+
 ## Install (macOS)
 
 1. Grab the `.dmg` from [Releases](../../releases) and drag **joverOS** to Applications.

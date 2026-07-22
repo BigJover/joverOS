@@ -78,7 +78,7 @@ const ROUTER_PROMPT: &str = "You route commands for a desktop agent bar. Classif
   * content to find on the site, or a person you don't know the exact page for -> the site's own search URL (\"youtube lofi study mix\" -> https://www.youtube.com/results?search_query=lofi+study+mix, \"amazon airpods\" -> https://www.amazon.com/s?k=airpods)\n\
 - web_search: the user wants to search the web or look up a question or topic. Set \"query\" to the search terms only.\n\
 For web_open and web_search: if the user names a browser (e.g. chrome, safari, firefox), also set \"app\" to that browser's name.\n\
-- file_search: the user wants to FIND files, documents, or folders on this computer (finding only, no changes). Set \"query\" to the search terms.\n\
+- file_search: the user wants to FIND files, documents, or folders on this computer (finding only, no changes). Set \"query\" to only the words likely in the file's name or contents — drop filler like \"find\", \"my\", \"that\", \"file\".\n\
 - unknown: anything else — including deleting or cleaning up files, emptying trash, changing settings, or installing software. Set \"reply\" to one short sentence stating you can't do that yet.\n\
 Respond with JSON only.";
 
@@ -120,6 +120,59 @@ async fn route_intent(input: String) -> Result<Intent, String> {
         .as_str()
         .ok_or_else(|| format!("empty response: {v}"))?;
     serde_json::from_str(content).map_err(|e| format!("bad intent JSON: {e}"))
+}
+
+// --- File search (M2). Spotlight IS the local file index on macOS; the Linux
+// shell will need its own indexer at M5. Read-only — finding needs no
+// permission prompt, opening is user-initiated, and changes will only ever
+// come through the confirmation layer.
+
+#[derive(serde::Serialize, Clone)]
+struct FileHit {
+    name: String,
+    path: String,
+}
+
+fn mdfind(args: &[&str]) -> Vec<String> {
+    Command::new("mdfind")
+        .args(args)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn search_files(query: String) -> Vec<FileHit> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut paths: Vec<String> = Vec::new();
+    // Name matches first (usually what's meant), content matches fill the rest.
+    for list in [
+        mdfind(&["-onlyin", &home, "-name", &query]),
+        mdfind(&["-onlyin", &home, &query]),
+    ] {
+        for p in list {
+            // caches, dependencies, dotfolders — machinery, not the user's files
+            if p.contains("/Library/") || p.contains("/node_modules/") || p.contains("/.") {
+                continue;
+            }
+            if paths.len() >= 8 {
+                break;
+            }
+            if !paths.contains(&p) {
+                paths.push(p);
+            }
+        }
+    }
+    paths
+        .into_iter()
+        .map(|p| FileHit {
+            name: Path::new(&p)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.clone()),
+            path: p,
+        })
+        .collect()
 }
 
 // --- Agent memory (SQLite, per spec) — first table: learned web destinations.
@@ -326,6 +379,7 @@ pub fn run() {
             launch_app,
             hide_bar,
             route_intent,
+            search_files,
             open_url,
             resolve_web,
             recall_web,

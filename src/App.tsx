@@ -5,6 +5,8 @@ import "./App.css";
 
 type AppEntry = { name: string; path: string };
 
+type FileHit = { name: string; path: string };
+
 type Intent = {
   intent: "app_launch" | "web_open" | "web_search" | "file_search" | "unknown";
   app?: string;
@@ -88,6 +90,7 @@ function App() {
   const [apps, setApps] = useState<AppEntry[]>([]);
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
+  const [files, setFiles] = useState<FileHit[]>([]);
   const [thinking, setThinking] = useState(false);
   const [status, setStatus] = useState("");
   const [reply, setReply] = useState("");
@@ -98,6 +101,7 @@ function App() {
     const unlisten = listen("bar-shown", () => {
       setQuery("");
       setSelected(0);
+      setFiles([]);
       setThinking(false);
       setStatus("");
       setReply("");
@@ -211,7 +215,15 @@ function App() {
           await invoke("remember_web", { input, url: opened });
         }
       } else if (intent.intent === "file_search") {
-        setReply(`File search isn't wired up yet (coming in M2). Heard: “${intent.query ?? input}”.`);
+        const q = (intent.query ?? input).trim();
+        setStatus(`searching files for ${q}…`);
+        const hits = await invoke<FileHit[]>("search_files", { query: q });
+        if (hits.length > 0) {
+          setFiles(hits);
+          setSelected(0);
+        } else {
+          setReply(`No files matching “${q}”.`);
+        }
       } else {
         setReply(intent.reply || "Can't do that yet.");
       }
@@ -227,12 +239,14 @@ function App() {
       invoke("hide_bar");
     } else if (e.key === "ArrowDown") {
       e.preventDefault();
-      setSelected((s) => Math.min(s + 1, results.length - 1));
+      setSelected((s) => Math.min(s + 1, (files.length || results.length) - 1));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       setSelected((s) => Math.max(s - 1, 0));
     } else if (e.key === "Enter") {
-      if (results[selected]) {
+      if (files[selected]) {
+        launch(files[selected].path);
+      } else if (results[selected]) {
         launch(results[selected].path);
       } else if (query.trim() && !thinking) {
         route(query.trim());
@@ -251,10 +265,25 @@ function App() {
         onChange={(e) => {
           setQuery(e.target.value);
           setSelected(0);
+          setFiles([]);
           setReply("");
         }}
       />
-      {results.length > 0 && (
+      {files.length > 0 && (
+        <ul className="results">
+          {files.map((f, i) => (
+            <li
+              key={f.path}
+              className={i === selected ? "selected" : ""}
+              onMouseDown={() => launch(f.path)}
+            >
+              {f.name}
+              <span className="path">{f.path.replace(/^\/Users\/[^/]+/, "~")}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {files.length === 0 && results.length > 0 && (
         <ul className="results">
           {results.map((r, i) => (
             <li

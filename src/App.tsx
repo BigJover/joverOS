@@ -5,7 +5,22 @@ import "./App.css";
 
 type AppEntry = { name: string; path: string };
 
-type FileHit = { name: string; path: string };
+type FileHit = { name: string; path: string; mtime: number; size: number };
+
+// Qualifier words aren't search terms — nothing is *named* "recent". They
+// come out of the query and order the results instead.
+const SORT_WORDS: Record<string, (a: FileHit, b: FileHit) => number> = {
+  recent: (a, b) => b.mtime - a.mtime,
+  latest: (a, b) => b.mtime - a.mtime,
+  newest: (a, b) => b.mtime - a.mtime,
+  new: (a, b) => b.mtime - a.mtime,
+  last: (a, b) => b.mtime - a.mtime,
+  oldest: (a, b) => a.mtime - b.mtime,
+  old: (a, b) => a.mtime - b.mtime,
+  biggest: (a, b) => b.size - a.size,
+  largest: (a, b) => b.size - a.size,
+  smallest: (a, b) => a.size - b.size,
+};
 
 type PlannedMove = { from: string; to: string };
 type OrganizePlan = { summary: string; moves: PlannedMove[] };
@@ -273,7 +288,17 @@ function App() {
           setReply(`${p.summary} — Enter to do it, Esc to cancel.`);
         }
       } else if (intent.intent === "file_search") {
-        const q = (intent.query ?? input).trim();
+        const raw = (intent.query ?? input).trim();
+        let sortBy: ((a: FileHit, b: FileHit) => number) | null = null;
+        const kept = raw.split(/\s+/).filter((w) => {
+          const s = SORT_WORDS[w.toLowerCase()];
+          if (s && !sortBy) {
+            sortBy = s;
+            return false;
+          }
+          return true;
+        });
+        const q = kept.join(" ") || raw;
         setStatus(`searching files for ${q}…`);
         let hits = await invoke<FileHit[]>("search_files", { query: q });
         if (hits.length > 8) {
@@ -284,6 +309,7 @@ function App() {
           }).catch(() => [] as number[]);
           if (order.length > 0) hits = order.map((i) => hits[i]);
         }
+        if (sortBy) hits = [...hits].sort(sortBy);
         hits = hits.slice(0, 8);
         if (hits.length > 0) {
           setFiles(hits);

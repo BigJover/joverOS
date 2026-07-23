@@ -138,6 +138,9 @@ async fn route_intent(input: String) -> Result<Intent, String> {
 struct FileHit {
     name: String,
     path: String,
+    // metadata rides along so "recent"/"biggest" can order results
+    mtime: i64,
+    size: u64,
 }
 
 fn mdfind(args: &[&str]) -> Vec<String> {
@@ -215,12 +218,22 @@ fn search_files(query: String) -> Vec<FileHit> {
     );
     paths
         .into_iter()
-        .map(|p| FileHit {
-            name: Path::new(&p)
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| p.clone()),
-            path: p,
+        .map(|p| {
+            let md = std::fs::metadata(&p).ok();
+            FileHit {
+                name: Path::new(&p)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.clone()),
+                mtime: md
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+                size: md.map(|m| m.len()).unwrap_or(0),
+                path: p,
+            }
         })
         .collect()
 }

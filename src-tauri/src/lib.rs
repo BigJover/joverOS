@@ -168,11 +168,14 @@ fn add_hits(list: Vec<String>, paths: &mut Vec<String>, cap: usize) {
 }
 
 #[tauri::command]
-fn search_files(query: String) -> Vec<FileHit> {
+fn search_files(query: String, kind: Option<String>, since: Option<i64>, until: Option<i64>, order: Option<String>) -> Vec<FileHit> {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut paths: Vec<String> = Vec::new();
+    let no_terms = query.trim().is_empty();
     // Overshoot the visible 8: the surplus feeds the reranker when needed.
-    let cap = 24;
+    // A kind/date-only search ("recent pictures") has no name to anchor on,
+    // so it casts wide and lets the metadata sort pick the top.
+    let cap = if no_terms { 3000 } else { 24 };
 
     // Exact phrase in the name beats everything. Stems too, so "resumes"
     // still finds Resume.pdf.
@@ -181,9 +184,11 @@ fn search_files(query: String) -> Vec<FileHit> {
         .map(|w| w.trim_end_matches('s'))
         .collect::<Vec<_>>()
         .join(" ");
-    add_hits(mdfind(&["-onlyin", &home, "-name", &query]), &mut paths, cap);
-    if stemmed != query {
-        add_hits(mdfind(&["-onlyin", &home, "-name", &stemmed]), &mut paths, cap);
+    if !no_terms {
+        add_hits(mdfind(&["-onlyin", &home, "-name", &query]), &mut paths, cap);
+        if stemmed != query {
+            add_hits(mdfind(&["-onlyin", &home, "-name", &stemmed]), &mut paths, cap);
+        }
     }
 
     // People don't name things the way they ask for them: "spring break
@@ -209,14 +214,16 @@ fn search_files(query: String) -> Vec<FileHit> {
         add_hits(scored.into_iter().map(|(p, _)| p).collect(), &mut paths, cap);
     }
 
-    // Content matches fill whatever room is left — documents only, since
-    // "contains the word" is meaningless for code, caches, and binaries.
+    // Content matches fill whatever room is left. A requested kind scopes
+    // the match; otherwise documents only, since "contains the word" is
+    // meaningless for code, caches, and binaries.
+    let k = kind.as_deref().unwrap_or("document");
     add_hits(
-        mdfind(&["-onlyin", &home, &format!("{stemmed} kind:document")]),
+        mdfind(&["-onlyin", &home, &format!("{stemmed} kind:{k}").trim().to_string()]),
         &mut paths,
         cap,
     );
-    paths
+    let mut hits: Vec<FileHit> = paths
         .into_iter()
         .map(|p| {
             let md = std::fs::metadata(&p).ok();
@@ -235,7 +242,20 @@ fn search_files(query: String) -> Vec<FileHit> {
                 path: p,
             }
         })
-        .collect()
+        .filter(|h| since.is_none_or(|t| h.mtime >= t) && until.is_none_or(|t| h.mtime < t))
+        .collect();
+    // No name terms means no relevance order exists — the requested order
+    // (newest by default) decides which of the wide net survive the trim.
+    if no_terms {
+        match order.as_deref() {
+            Some("old") => hits.sort_by(|a, b| a.mtime.cmp(&b.mtime)),
+            Some("big") => hits.sort_by(|a, b| b.size.cmp(&a.size)),
+            Some("small") => hits.sort_by(|a, b| a.size.cmp(&b.size)),
+            _ => hits.sort_by(|a, b| b.mtime.cmp(&a.mtime)),
+        }
+        hits.truncate(24);
+    }
+    hits
 }
 
 // Too many hits? One model call judges which candidates ARE the thing

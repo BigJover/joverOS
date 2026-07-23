@@ -7,20 +7,100 @@ type AppEntry = { name: string; path: string };
 
 type FileHit = { name: string; path: string; mtime: number; size: number };
 
-// Qualifier words aren't search terms — nothing is *named* "recent". They
-// come out of the query and order the results instead.
-const SORT_WORDS: Record<string, (a: FileHit, b: FileHit) => number> = {
-  recent: (a, b) => b.mtime - a.mtime,
-  latest: (a, b) => b.mtime - a.mtime,
-  newest: (a, b) => b.mtime - a.mtime,
+// Determiners aren't search terms — nothing is *named* "recent" or
+// "pictures". They come out of the query and become ordering (sort words),
+// a date window (time phrases), or a Spotlight kind filter (type words).
+type SortKey = "new" | "old" | "big" | "small";
+const SORT_FNS: Record<SortKey, (a: FileHit, b: FileHit) => number> = {
   new: (a, b) => b.mtime - a.mtime,
-  last: (a, b) => b.mtime - a.mtime,
-  oldest: (a, b) => a.mtime - b.mtime,
   old: (a, b) => a.mtime - b.mtime,
-  biggest: (a, b) => b.size - a.size,
-  largest: (a, b) => b.size - a.size,
-  smallest: (a, b) => a.size - b.size,
+  big: (a, b) => b.size - a.size,
+  small: (a, b) => a.size - b.size,
 };
+const SORT_WORDS: Record<string, SortKey> = {
+  recent: "new", latest: "new", newest: "new", new: "new", last: "new",
+  current: "new", freshest: "new",
+  oldest: "old", old: "old", earliest: "old", original: "old", first: "old",
+  biggest: "big", largest: "big", big: "big", large: "big", huge: "big", fattest: "big",
+  smallest: "small", small: "small", tiniest: "small", tiny: "small", lightest: "small",
+};
+
+// Type words -> Spotlight kind filters (folders that *name* the thing still
+// match — a "spring break" folder counts as pictures).
+const KIND_WORDS: Record<string, string> = {
+  picture: "image", photo: "image", image: "image", pic: "image",
+  screenshot: "image", wallpaper: "image",
+  video: "movie", movie: "movie", film: "movie", clip: "movie", recording: "movie",
+  song: "music", music: "music", audio: "music", track: "music",
+  pdf: "pdf",
+  document: "document", doc: "document",
+  spreadsheet: "spreadsheet", excel: "spreadsheet",
+  presentation: "presentation", powerpoint: "presentation", slideshow: "presentation", deck: "presentation",
+  folder: "folder", directory: "folder",
+  note: "text", text: "text",
+};
+
+// Time phrases -> [since, until) windows in epoch seconds. Checked before
+// single words so "last week" never reads as sort-word "last" + "week".
+const DAY = 86400;
+function timeWindow(phrase: string): [number, number | null] | null {
+  const now = Math.floor(Date.now() / 1000);
+  const midnight = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
+  switch (phrase) {
+    case "today": return [midnight, null];
+    case "yesterday": return [midnight - DAY, midnight];
+    case "this week": case "past week": return [now - 7 * DAY, null];
+    case "last week": return [now - 14 * DAY, now - 7 * DAY];
+    case "this month": case "past month": return [now - 30 * DAY, null];
+    case "last month": return [now - 60 * DAY, now - 30 * DAY];
+    case "this year": case "past year": return [now - 365 * DAY, null];
+    case "last year": return [now - 730 * DAY, now - 365 * DAY];
+    default: return null;
+  }
+}
+
+// dangling connectives left behind once determiners are stripped
+const FILLER = new Set(["from", "of", "the", "my", "a", "an", "in", "that"]);
+
+type ParsedSearch = {
+  terms: string;
+  sortBy: SortKey | null;
+  kind: string | null;
+  since: number | null;
+  until: number | null;
+};
+
+function parseSearch(raw: string): ParsedSearch {
+  const words = raw.split(/\s+/);
+  const out: ParsedSearch = { terms: "", sortBy: null, kind: null, since: null, until: null };
+  const kept: string[] = [];
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i].toLowerCase();
+    const pair = i + 1 < words.length ? `${w} ${words[i + 1].toLowerCase()}` : "";
+    const win = timeWindow(pair) ?? timeWindow(w);
+    if (win) {
+      [out.since, out.until] = win;
+      if (timeWindow(pair)) i++;
+      continue;
+    }
+    const stem = w.replace(/s$/, "");
+    if (!out.kind && KIND_WORDS[stem]) {
+      out.kind = KIND_WORDS[stem];
+      continue;
+    }
+    if (!out.sortBy && SORT_WORDS[w]) {
+      out.sortBy = SORT_WORDS[w];
+      continue;
+    }
+    kept.push(words[i]);
+  }
+  const terms = kept.filter((w) => !FILLER.has(w.toLowerCase()));
+  out.terms = terms.join(" ");
+  // a bare "find pictures" with no other signal should read as browsing,
+  // newest first — not an alphabetical grab-bag
+  if (!out.terms && !out.sortBy) out.sortBy = "new";
+  return out;
+}
 
 type PlannedMove = { from: string; to: string };
 type OrganizePlan = { summary: string; moves: PlannedMove[] };
@@ -289,19 +369,16 @@ function App() {
         }
       } else if (intent.intent === "file_search") {
         const raw = (intent.query ?? input).trim();
-        let sortBy: ((a: FileHit, b: FileHit) => number) | null = null;
-        const kept = raw.split(/\s+/).filter((w) => {
-          const s = SORT_WORDS[w.toLowerCase()];
-          if (s && !sortBy) {
-            sortBy = s;
-            return false;
-          }
-          return true;
+        const { terms: q, sortBy, kind, since, until } = parseSearch(raw);
+        setStatus(`searching files for ${q || kind || "recent"}…`);
+        let hits = await invoke<FileHit[]>("search_files", {
+          query: q,
+          kind,
+          since,
+          until,
+          order: sortBy,
         });
-        const q = kept.join(" ") || raw;
-        setStatus(`searching files for ${q}…`);
-        let hits = await invoke<FileHit[]>("search_files", { query: q });
-        if (hits.length > 8) {
+        if (q && hits.length > 8) {
           setStatus(`narrowing ${hits.length} matches…`);
           const order = await invoke<number[]>("rerank_files", {
             query: q,
@@ -309,13 +386,13 @@ function App() {
           }).catch(() => [] as number[]);
           if (order.length > 0) hits = order.map((i) => hits[i]);
         }
-        if (sortBy) hits = [...hits].sort(sortBy);
+        if (sortBy) hits = [...hits].sort(SORT_FNS[sortBy]);
         hits = hits.slice(0, 8);
         if (hits.length > 0) {
           setFiles(hits);
           setSelected(0);
         } else {
-          setReply(`No files matching “${q}”.`);
+          setReply(`No files matching “${raw}”.`);
         }
       } else {
         setReply(intent.reply || "Can't do that yet.");

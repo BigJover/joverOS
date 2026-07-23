@@ -25,6 +25,9 @@ Certain first words pin what happens, deterministically — no model, no guessin
 | You type | It always means |
 |---|---|
 | `find …` / `where is …` / `locate …` | search **your files** |
+| &nbsp;&nbsp;↳ `recent` / `oldest` / `biggest` / `smallest` … | **order** the results (`find recent resume`) |
+| &nbsp;&nbsp;↳ `pictures` / `videos` / `pdfs` / `music` / `folders` … | filter by **type** (`find biggest video`) |
+| &nbsp;&nbsp;↳ `today` / `yesterday` / `this week` / `last month` … | filter by **when** (`find screenshots from today`) |
 | `search …` / `look up …` | search **the web** |
 | `launch …` | open **an app** |
 | `youtube …`, `reddit …`, `amazon …`, … | go to / search **that site** |

@@ -84,3 +84,7 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+.reply {
+  white-space: pre-line;
+}

@@ -80,6 +80,7 @@ const ROUTER_PROMPT: &str = "You route commands for a desktop agent bar. Classif
 For web_open and web_search: if the user names a browser (e.g. chrome, safari, firefox), also set \"app\" to that browser's name.\n\
 - file_search: the user wants to FIND files, documents, or folders on this computer (finding only, no changes). Set \"query\" to only the words likely in the file's name or contents — drop filler like \"find\", \"my\", \"that\", \"file\".\n\
 - file_organize: the user wants to tidy/organize/sort a folder's files into subfolders (moving only, never deleting). Set \"query\" to the folder name (e.g. downloads, desktop).\n\
+- troubleshoot: the user reports a computer problem to diagnose — disk full, out of storage, wants to know what's taking up space. Set \"query\" to the problem area (disk).\n\
 - unknown: anything else — including deleting files, emptying trash, changing settings, or installing software. Set \"reply\" to one short sentence stating you can't do that yet.\n\
 Respond with JSON only.";
 
@@ -116,7 +117,7 @@ async fn route_intent(input: String) -> Result<Intent, String> {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
-            "intent": { "type": "string", "enum": ["app_launch", "web_open", "web_search", "file_search", "file_organize", "unknown"] },
+            "intent": { "type": "string", "enum": ["app_launch", "web_open", "web_search", "file_search", "file_organize", "troubleshoot", "unknown"] },
             "app": { "type": "string" },
             "query": { "type": "string" },
             "url": { "type": "string" },
@@ -435,6 +436,86 @@ fn undo_last(app: AppHandle) -> Result<String, String> {
     Ok(format!("Put {back} files back."))
 }
 
+// --- Troubleshooting (M2, first domain: disk space). Real diagnostics,
+// plain-language report, read-only — freeing space is a change, and changes
+// wait for the confirmation layer (M3).
+
+#[tauri::command]
+fn diagnose_disk() -> Result<String, String> {
+    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+    let gb = |kb: f64| kb * 1024.0 / 1e9;
+    let run = |cmd: &str, args: &[&str]| {
+        Command::new(cmd)
+            .args(args)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
+
+    let mut out = String::new();
+    if let Some(line) = run("df", &["-k", &home]).lines().nth(1) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() > 3 {
+            let (total, used, free) = (
+                f[1].parse::<f64>().unwrap_or(0.0),
+                f[2].parse::<f64>().unwrap_or(0.0),
+                f[3].parse::<f64>().unwrap_or(0.0),
+            );
+            out.push_str(&format!(
+                "Disk: {:.0} GB used of {:.0} GB — {:.0} GB free.\n",
+                gb(used),
+                gb(total),
+                gb(free)
+            ));
+        }
+    }
+
+    // The usual suspects. Trash is privacy-gated until the app has Full
+    // Disk Access — report no access rather than a silent zero.
+    let mut hotspots = Vec::new();
+    for (label, rel) in [("Trash", ".Trash"), ("Downloads", "Downloads"), ("Caches", "Library/Caches")] {
+        let du = run("du", &["-sk", &format!("{home}/{rel}")]);
+        match du.split_whitespace().next().and_then(|k| k.parse::<f64>().ok()) {
+            Some(kb) if gb(kb) >= 0.1 => hotspots.push(format!("{label} {:.1} GB", gb(kb))),
+            Some(_) => {}
+            None => hotspots.push(format!("{label} (no access)")),
+        }
+    }
+    if !hotspots.is_empty() {
+        out.push_str(&hotspots.join(" · "));
+        out.push('\n');
+    }
+
+    // Biggest items, straight from Spotlight's index — instant, and it
+    // sees inside app bundles the way a user thinks of them (one item).
+    let mut big: Vec<(String, f64)> = run(
+        "mdfind",
+        &["-onlyin", &home, "kMDItemFSSize > 1073741824", "-attr", "kMDItemFSSize"],
+    )
+    .lines()
+    .filter_map(|l| {
+        let (path, attr) = l.split_once("   kMDItemFSSize = ")?;
+        let bytes: f64 = attr.trim().parse().ok()?;
+        // an item inside a .app belongs to the app, not the list
+        if path.rfind(".app/").is_some() {
+            return None;
+        }
+        Some((path.to_string(), bytes / 1e9))
+    })
+    .collect();
+    big.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    big.truncate(5);
+    if !big.is_empty() {
+        out.push_str("Biggest:\n");
+        for (path, g) in big {
+            let short = path.replacen(&home, "~", 1);
+            out.push_str(&format!("  {g:.1} GB  {short}\n"));
+        }
+    }
+    out.push_str("I only looked — freeing space comes later, with your say-so each time.");
+    Ok(out)
+}
+
 // --- Agent memory (SQLite, per spec) — first table: learned web destinations.
 
 fn mem_db(app: &AppHandle) -> Result<rusqlite::Connection, String> {
@@ -652,6 +733,7 @@ pub fn run() {
             route_intent,
             search_files,
             rerank_files,
+            diagnose_disk,
             plan_organize,
             apply_organize,
             undo_last,

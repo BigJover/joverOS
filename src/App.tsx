@@ -11,7 +11,7 @@ type PlannedMove = { from: string; to: string };
 type OrganizePlan = { summary: string; moves: PlannedMove[] };
 
 type Intent = {
-  intent: "app_launch" | "web_open" | "web_search" | "file_search" | "file_organize" | "unknown";
+  intent: "app_launch" | "web_open" | "web_search" | "file_search" | "file_organize" | "troubleshoot" | "unknown";
   app?: string;
   query?: string;
   url?: string;
@@ -89,16 +89,18 @@ const VERB_PINS: { verbs: string[]; intent: Intent["intent"] }[] = [
   { verbs: ["search for", "search", "look up", "lookup"], intent: "web_search" },
   { verbs: ["launch", "open app"], intent: "app_launch" },
   { verbs: ["organize", "tidy", "clean up", "sort"], intent: "file_organize" },
+  { verbs: ["disk space", "storage"], intent: "troubleshoot" },
 ];
 
 function verbPin(input: string): Intent | null {
   const lower = input.toLowerCase();
   for (const { verbs, intent } of VERB_PINS) {
     for (const v of verbs) {
-      if (!lower.startsWith(v + " ")) continue;
+      if (lower !== v && !lower.startsWith(v + " ")) continue;
       let rest = input.slice(v.length + 1).trim();
       if (intent === "file_search") rest = rest.replace(/^(my|the)\s+/i, "");
       if (intent === "app_launch") return { intent, app: rest };
+      if (intent === "troubleshoot") return { intent, query: "disk" };
       return { intent, query: rest };
     }
   }
@@ -257,6 +259,9 @@ function App() {
         if (learn && opened === learn) {
           await invoke("remember_web", { input, url: opened });
         }
+      } else if (intent.intent === "troubleshoot") {
+        setStatus("checking disk…");
+        setReply(await invoke<string>("diagnose_disk"));
       } else if (intent.intent === "file_organize") {
         const p = await invoke<OrganizePlan>("plan_organize", {
           folder: intent.query ?? input,

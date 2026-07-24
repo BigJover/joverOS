@@ -141,9 +141,10 @@ struct FileHit {
     // metadata rides along so "recent"/"biggest" can order results
     mtime: i64,
     size: u64,
-    // matched by name, not merely by containing the words — sorting must
-    // never let an incidental content match outrank the thing itself
-    named: bool,
+    // how the file earned its place: 4 exact name, 3 stemmed name,
+    // 2 partial name, 1 content-only. Sorting must never let a weaker
+    // match outrank a stronger one, whatever the qualifier says.
+    rank: u8,
 }
 
 fn mdfind(args: &[&str]) -> Vec<String> {
@@ -187,11 +188,14 @@ fn search_files(query: String, kind: Option<String>, since: Option<i64>, until: 
         .map(|w| w.trim_end_matches('s'))
         .collect::<Vec<_>>()
         .join(" ");
+    let mut tiers = [0usize; 3]; // paths.len() after exact / stemmed / partial
     if !no_terms {
         add_hits(mdfind(&["-onlyin", &home, "-name", &query]), &mut paths, cap);
+        tiers[0] = paths.len();
         if stemmed != query {
             add_hits(mdfind(&["-onlyin", &home, "-name", &stemmed]), &mut paths, cap);
         }
+        tiers[1] = paths.len();
     }
 
     // People don't name things the way they ask for them: "spring break
@@ -216,8 +220,7 @@ fn search_files(query: String, kind: Option<String>, since: Option<i64>, until: 
         scored.sort_by(|a, b| b.1.cmp(&a.1));
         add_hits(scored.into_iter().map(|(p, _)| p).collect(), &mut paths, cap);
     }
-
-    let name_hits = paths.len();
+    tiers[2] = paths.len();
 
     // Content matches fill whatever room is left. A requested kind scopes
     // the match; otherwise documents only, since "contains the word" is
@@ -245,7 +248,12 @@ fn search_files(query: String, kind: Option<String>, since: Option<i64>, until: 
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0),
                 size: md.map(|m| m.len()).unwrap_or(0),
-                named: i < name_hits,
+                rank: match i {
+                    i if i < tiers[0] => 4,
+                    i if i < tiers[1] => 3,
+                    i if i < tiers[2] => 2,
+                    _ => 1,
+                },
                 path: p,
             }
         })

@@ -5,7 +5,7 @@ import "./App.css";
 
 type AppEntry = { name: string; path: string };
 
-type FileHit = { name: string; path: string; mtime: number; size: number; named: boolean };
+type FileHit = { name: string; path: string; mtime: number; size: number; rank: number };
 
 // Determiners aren't search terms — nothing is *named* "recent" or
 // "pictures". They come out of the query and become ordering (sort words),
@@ -386,14 +386,13 @@ function App() {
           }).catch(() => [] as number[]);
           if (order.length > 0) hits = order.map((i) => hits[i]);
         }
-        if (sortBy) {
-          // name matches stay above content-only matches; the qualifier
-          // orders within each tier
-          const fn = SORT_FNS[sortBy];
-          hits = [...hits].sort(
-            (a, b) => Number(b.named) - Number(a.named) || fn(a, b)
-          );
-        }
+        // Ordering contract, whatever the query: files matched by NAME
+        // always rank above files that merely mention the words, and the
+        // qualifier (recency when none given) orders within each side of
+        // that line — never across it.
+        const named = (h: FileHit) => (h.rank >= 2 ? 1 : 0);
+        const fn = sortBy ? SORT_FNS[sortBy] : SORT_FNS.new;
+        hits = [...hits].sort((a, b) => named(b) - named(a) || fn(a, b));
         hits = hits.slice(0, 8);
         if (hits.length > 0) {
           setFiles(hits);

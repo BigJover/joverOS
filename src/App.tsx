@@ -5,7 +5,7 @@ import "./App.css";
 
 type AppEntry = { name: string; path: string };
 
-type FileHit = { name: string; path: string; mtime: number; size: number };
+type FileHit = { name: string; path: string; mtime: number; size: number; named: boolean };
 
 // Determiners aren't search terms — nothing is *named* "recent" or
 // "pictures". They come out of the query and become ordering (sort words),
@@ -386,7 +386,14 @@ function App() {
           }).catch(() => [] as number[]);
           if (order.length > 0) hits = order.map((i) => hits[i]);
         }
-        if (sortBy) hits = [...hits].sort(SORT_FNS[sortBy]);
+        if (sortBy) {
+          // name matches stay above content-only matches; the qualifier
+          // orders within each tier
+          const fn = SORT_FNS[sortBy];
+          hits = [...hits].sort(
+            (a, b) => Number(b.named) - Number(a.named) || fn(a, b)
+          );
+        }
         hits = hits.slice(0, 8);
         if (hits.length > 0) {
           setFiles(hits);

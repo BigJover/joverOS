@@ -141,6 +141,9 @@ struct FileHit {
     // metadata rides along so "recent"/"biggest" can order results
     mtime: i64,
     size: u64,
+    // matched by name, not merely by containing the words — sorting must
+    // never let an incidental content match outrank the thing itself
+    named: bool,
 }
 
 fn mdfind(args: &[&str]) -> Vec<String> {
@@ -214,6 +217,8 @@ fn search_files(query: String, kind: Option<String>, since: Option<i64>, until: 
         add_hits(scored.into_iter().map(|(p, _)| p).collect(), &mut paths, cap);
     }
 
+    let name_hits = paths.len();
+
     // Content matches fill whatever room is left. A requested kind scopes
     // the match; otherwise documents only, since "contains the word" is
     // meaningless for code, caches, and binaries.
@@ -225,7 +230,8 @@ fn search_files(query: String, kind: Option<String>, since: Option<i64>, until: 
     );
     let mut hits: Vec<FileHit> = paths
         .into_iter()
-        .map(|p| {
+        .enumerate()
+        .map(|(i, p)| {
             let md = std::fs::metadata(&p).ok();
             FileHit {
                 name: Path::new(&p)
@@ -239,6 +245,7 @@ fn search_files(query: String, kind: Option<String>, since: Option<i64>, until: 
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0),
                 size: md.map(|m| m.len()).unwrap_or(0),
+                named: i < name_hits,
                 path: p,
             }
         })

@@ -1,6 +1,6 @@
 [package]
 name = "joveros"
-version = "0.1.0"
+version = "0.2.0"
 description = "joverOS — the agent-first OS shell"
 authors = ["Jovan Kirovski"]
 edition = "2021"

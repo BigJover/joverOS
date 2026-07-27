@@ -222,15 +222,19 @@ fn search_files(query: String, kind: Option<String>, since: Option<i64>, until: 
     }
     tiers[2] = paths.len();
 
-    // Content matches fill whatever room is left. A requested kind scopes
-    // the match; otherwise documents only, since "contains the word" is
-    // meaningless for code, caches, and binaries.
-    let k = kind.as_deref().unwrap_or("document");
-    add_hits(
-        mdfind(&["-onlyin", &home, &format!("{stemmed} kind:{k}").trim().to_string()]),
-        &mut paths,
-        cap,
-    );
+    // Content matches are a FALLBACK, not filler: a file that merely
+    // mentions the words is never relevant next to files named for them,
+    // so it only appears when nothing matched by name at all. A requested
+    // kind scopes the match; otherwise documents only, since "contains
+    // the word" is meaningless for code, caches, and binaries.
+    if paths.is_empty() {
+        let k = kind.as_deref().unwrap_or("document");
+        add_hits(
+            mdfind(&["-onlyin", &home, &format!("{stemmed} kind:{k}").trim().to_string()]),
+            &mut paths,
+            cap,
+        );
+    }
     let mut hits: Vec<FileHit> = paths
         .into_iter()
         .enumerate()

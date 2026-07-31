@@ -299,8 +299,13 @@ function App() {
     setStatus("");
     try {
       // "undo" is a reserved word: straight to the log, no model.
-      if (/^(undo|put (it |that )?back|restore trash)$/i.test(input.trim())) {
+      if (/^(undo|put (it |that )?back)$/i.test(input.trim())) {
         setReply(await invoke<string>("undo_last"));
+        return;
+      }
+      // restore trash ≠ undo: brings back everything the bar ever trashed
+      if (/^restore (the )?trash$/i.test(input.trim())) {
+        setReply(await invoke<string>("restore_trash"));
         return;
       }
 

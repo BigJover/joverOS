@@ -885,6 +885,66 @@ fn trash_file(app: AppHandle, path: String) -> Result<String, String> {
     Ok(format!("Moved {name} to Trash — undo puts it back."))
 }
 
+// "restore trash" restores everything the bar itself trashed that is
+// still in the Trash — any batch, not just the last. Items trashed in
+// Finder can't be bulk-restored by anyone but Finder: their original
+// locations live in Finder's private records, with no API. Say so
+// instead of silently doing nothing.
+#[tauri::command]
+fn restore_trash(app: AppHandle) -> Result<String, String> {
+    let conn = mem_db(&app)?;
+    let rows: Vec<(i64, String, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, src, dst FROM file_ops WHERE dst LIKE 'trash:%' ORDER BY id DESC")
+            .map_err(|e| e.to_string())?;
+        let r = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
+        r
+    };
+    let mut back = 0usize;
+    for (id, src, dst) in &rows {
+        let Some(name) = dst.strip_prefix("trash:") else { continue };
+        let Some(parent) = Path::new(src).parent().map(|p| p.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        let out = osa(&format!(
+            "tell application \"Finder\" to move (first item of trash whose name is \"{}\") to (POSIX file \"{}\" as alias)",
+            name.replace('"', "\\\""),
+            parent.replace('"', "\\\"")
+        ));
+        if !out.to_lowercase().contains("error") {
+            back += 1;
+            let _ = conn.execute("DELETE FROM file_ops WHERE id = ?1", [id]);
+        }
+    }
+    if back > 0 {
+        let _ = conn.execute(
+            "INSERT INTO history (action, detail) VALUES ('restore_trash', ?1)",
+            [format!("{back} items")],
+        );
+    }
+    let remaining = trash_count().unwrap_or(0);
+    Ok(match (back, remaining) {
+        (0, 0) => "Trash is empty — nothing to restore.".into(),
+        (0, n) => format!(
+            "The {n} item{} in the Trash {} put there in Finder, not by me — only Finder knows where {} came from. Open the Trash and use File → Put Back (⌘⌫).",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "was" } else { "were" },
+            if n == 1 { "it" } else { "they" }
+        ),
+        (b, 0) => format!("Put {b} file{} back where {} lived.", if b == 1 { "" } else { "s" }, if b == 1 { "it" } else { "they" }),
+        (b, n) => format!(
+            "Put {b} file{} back. {n} more {} trashed in Finder — File → Put Back (⌘⌫) there restores {}.",
+            if b == 1 { "" } else { "s" },
+            if n == 1 { "was" } else { "were" },
+            if n == 1 { "it" } else { "them" }
+        ),
+    })
+}
+
 // --- Empty trash (M3): the first destructive action, so it sets the
 // pattern — count first, confirm in the bar, go through Finder (macOS
 // asks its own one-time consent for that), record it in history.
@@ -1150,6 +1210,7 @@ pub fn run() {
             diagnose_slow,
             diagnose_audio,
             trash_file,
+            restore_trash,
             trash_count,
             empty_trash,
             set_volume,

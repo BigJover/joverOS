@@ -591,8 +591,16 @@ fn diagnose_wifi() -> Result<String, String> {
         .and_then(|s| s.lines().find_map(|l| l.trim().strip_prefix("Device: ")))
         .unwrap_or("en0")
         .to_string();
-    let ssid = sh("networksetup", &["-getairportnetwork", &dev]);
-    let ssid = ssid.trim().strip_prefix("Current Wi-Fi Network: ").map(str::to_string);
+    // networksetup lies on modern macOS ("not associated" while connected),
+    // and getsummary redacts the name without Location permission — so
+    // detect *connection* reliably and treat the name as a nice-to-have.
+    let ns = sh("networksetup", &["-getairportnetwork", &dev]);
+    let mut ssid = ns.trim().strip_prefix("Current Wi-Fi Network: ").map(str::to_string);
+    if ssid.is_none() {
+        ssid = sh("ipconfig", &["getsummary", &dev])
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("SSID : ").map(str::to_string));
+    }
     let ip = sh("ipconfig", &["getifaddr", &dev]).trim().to_string();
     let gw = sh("route", &["-n", "get", "default"])
         .lines()
@@ -605,7 +613,13 @@ fn diagnose_wifi() -> Result<String, String> {
 
     let mut out = String::new();
     match &ssid {
+        Some(name) if name == "<redacted>" => {
+            out.push_str("Wi-Fi: connected (macOS hides the network name from apps).\n")
+        }
         Some(name) => out.push_str(&format!("Wi-Fi: connected to {name}.\n")),
+        None if !ip.is_empty() => {
+            out.push_str("Wi-Fi: not detected, but you have a network address — wired or shared connection.\n")
+        }
         None => out.push_str("Wi-Fi: not connected to any network.\n"),
     }
     out.push_str(&format!(
@@ -615,7 +629,7 @@ fn diagnose_wifi() -> Result<String, String> {
         if net_ok { "reachable" } else { "unreachable" },
         if dns_ok { "working" } else { "failing" }
     ));
-    out.push_str(if ssid.is_none() {
+    out.push_str(if ssid.is_none() && ip.is_empty() {
         "→ Join a Wi-Fi network from the menu bar."
     } else if ip.is_empty() || !gw_ok {
         "→ Your Mac can't talk to the router. Rejoin the network; if that fails, restart the router."

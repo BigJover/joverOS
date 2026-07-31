@@ -15,7 +15,7 @@ Today it's a macOS launcher bar. The plan is bigger: this app becomes the deskto
 - **Find, don't know** — for pages the model can't know, the bar searches the live web (DuckDuckGo, keyless) scoped to the site you named, and opens the top real result. Worst case is the site's own search page, never a Google detour.
 - **Learned web memory** — destinations that worked are remembered in a local SQLite database and open instantly next time, zero model calls. Pages that die (404) are automatically unlearned and re-resolved fresh.
 - **Organize with a paper trail** — "organize my downloads" plans the moves, shows you the plan, and touches nothing until you confirm. Every move is logged to SQLite; `undo` puts everything back.
-- **Troubleshooting, starting with disk space** — "why is my disk full" reports used/free space, the usual hotspots (Trash, Downloads, caches), and your biggest items, in seconds. Read-only: it looks, tells you, and touches nothing.
+- **Troubleshooting** — disk space ("what's eating my disk"), network ("wifi isn't working" — walks the stack and names the broken layer), slowness ("why is my mac slow" — CPU hogs, memory pressure, load), and audio ("no sound" — mute/volume/output device). Real diagnostics, plain-language verdicts, read-only: it looks, tells you, and touches nothing.
 - **Honest refusals** — anything it can't safely do yet ("delete my files", "change my settings") gets a terse "can't do that yet", not a guess. Destructive abilities arrive only behind an explicit confirmation layer.
 
 ## Shortcuts — the bar's command vocabulary
@@ -34,7 +34,7 @@ Certain first words pin what happens, deterministically — no model, no guessin
 | `chrome …` / `firefox …` / `safari …` first word, or `… in firefox` | use **that browser** |
 | `organize downloads` / `tidy desktop` | plan a **by-type cleanup**, shown first — nothing moves until you press Enter |
 | `undo` | **reverse** the last file operation |
-| `disk space` / `storage` | **diagnose** what's eating your disk |
+| `disk space` / `wifi` / `sound` / "why is my mac slow" | **diagnose** the problem, layer by layer |
 
 Everything else is free-form — the local model figures out what you meant.
 

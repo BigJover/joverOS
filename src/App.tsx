@@ -184,7 +184,7 @@ const VERB_PINS: { verbs: string[]; intent: Intent["intent"] }[] = [
   { verbs: ["search for", "search", "look up", "lookup"], intent: "web_search" },
   { verbs: ["launch", "open app"], intent: "app_launch" },
   { verbs: ["organize", "tidy", "clean up", "sort"], intent: "file_organize" },
-  { verbs: ["disk space", "storage"], intent: "troubleshoot" },
+  { verbs: ["disk space", "storage", "wifi", "internet", "audio", "sound"], intent: "troubleshoot" },
 ];
 
 function verbPin(input: string): Intent | null {
@@ -195,7 +195,7 @@ function verbPin(input: string): Intent | null {
       let rest = input.slice(v.length + 1).trim();
       if (intent === "file_search") rest = rest.replace(/^(my|the)\s+/i, "");
       if (intent === "app_launch") return { intent, app: rest };
-      if (intent === "troubleshoot") return { intent, query: "disk" };
+      if (intent === "troubleshoot") return { intent, query: v };
       return { intent, query: rest };
     }
   }
@@ -355,8 +355,16 @@ function App() {
           await invoke("remember_web", { input, url: opened });
         }
       } else if (intent.intent === "troubleshoot") {
-        setStatus("checking disk…");
-        setReply(await invoke<string>("diagnose_disk"));
+        const area = (intent.query ?? input).toLowerCase();
+        const [cmd, what] = /wi-?fi|internet|network|online|connect/.test(area)
+          ? ["diagnose_wifi", "network"]
+          : /slow|sluggish|lag|freez|frozen/.test(area)
+          ? ["diagnose_slow", "what's slow"]
+          : /audio|sound|speaker|volume|mute|hear/.test(area)
+          ? ["diagnose_audio", "audio"]
+          : ["diagnose_disk", "disk"];
+        setStatus(`checking ${what}…`);
+        setReply(await invoke<string>(cmd));
       } else if (intent.intent === "file_organize") {
         const p = await invoke<OrganizePlan>("plan_organize", {
           folder: intent.query ?? input,

@@ -80,7 +80,7 @@ const ROUTER_PROMPT: &str = "You route commands for a desktop agent bar. Classif
 For web_open and web_search: if the user names a browser (e.g. chrome, safari, firefox), also set \"app\" to that browser's name.\n\
 - file_search: the user wants to FIND files, documents, or folders on this computer (finding only, no changes). Set \"query\" to only the words likely in the file's name or contents — drop filler like \"find\", \"my\", \"that\", \"file\".\n\
 - file_organize: the user wants to tidy/organize/sort a folder's files into subfolders (moving only, never deleting). Set \"query\" to the folder name (e.g. downloads, desktop).\n\
-- troubleshoot: the user reports a computer problem to diagnose — disk full, out of storage, wants to know what's taking up space. Set \"query\" to the problem area (disk).\n\
+- troubleshoot: the user reports a computer problem to diagnose — disk full, wifi/internet not working, computer running slow, sound/audio not working. Set \"query\" to the problem area: disk, wifi, slow, or audio.\n\
 - unknown: anything else — including deleting files, emptying trash, changing settings, or installing software. Set \"reply\" to one short sentence stating you can't do that yet.\n\
 Respond with JSON only.";
 
@@ -568,6 +568,175 @@ fn diagnose_disk() -> Result<String, String> {
     Ok(out)
 }
 
+fn sh(cmd: &str, args: &[&str]) -> String {
+    Command::new(cmd)
+        .args(args)
+        .output()
+        .map(|o| {
+            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+            s.push_str(&String::from_utf8_lossy(&o.stderr));
+            s
+        })
+        .unwrap_or_default()
+}
+
+// Walks the network stack layer by layer and names the first one that's
+// broken — that's the whole diagnosis a human expert would do.
+#[tauri::command]
+fn diagnose_wifi() -> Result<String, String> {
+    let hw = sh("networksetup", &["-listallhardwareports"]);
+    let dev = hw
+        .split("Hardware Port: Wi-Fi")
+        .nth(1)
+        .and_then(|s| s.lines().find_map(|l| l.trim().strip_prefix("Device: ")))
+        .unwrap_or("en0")
+        .to_string();
+    let ssid = sh("networksetup", &["-getairportnetwork", &dev]);
+    let ssid = ssid.trim().strip_prefix("Current Wi-Fi Network: ").map(str::to_string);
+    let ip = sh("ipconfig", &["getifaddr", &dev]).trim().to_string();
+    let gw = sh("route", &["-n", "get", "default"])
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("gateway: ").map(str::to_string))
+        .unwrap_or_default();
+    let ping_ok = |host: &str| sh("ping", &["-c", "1", "-t", "3", host]).contains(" 0.0% packet loss");
+    let gw_ok = !gw.is_empty() && ping_ok(&gw);
+    let net_ok = ping_ok("1.1.1.1");
+    let dns_ok = sh("dscacheutil", &["-q", "host", "-a", "name", "apple.com"]).contains("ip_address");
+
+    let mut out = String::new();
+    match &ssid {
+        Some(name) => out.push_str(&format!("Wi-Fi: connected to {name}.\n")),
+        None => out.push_str("Wi-Fi: not connected to any network.\n"),
+    }
+    out.push_str(&format!(
+        "Address from router: {} · Router: {} · Internet: {} · DNS: {}\n",
+        if ip.is_empty() { "none" } else { "yes" },
+        if gw_ok { "reachable" } else { "unreachable" },
+        if net_ok { "reachable" } else { "unreachable" },
+        if dns_ok { "working" } else { "failing" }
+    ));
+    out.push_str(if ssid.is_none() {
+        "→ Join a Wi-Fi network from the menu bar."
+    } else if ip.is_empty() || !gw_ok {
+        "→ Your Mac can't talk to the router. Rejoin the network; if that fails, restart the router."
+    } else if !net_ok {
+        "→ Router is fine but the internet beyond it is down — modem or provider. Restart the modem; if it persists, it's your ISP."
+    } else if !dns_ok {
+        "→ Internet works but name lookups fail. Rejoining the network usually clears this."
+    } else {
+        "→ Network looks healthy end to end. If a site is failing, the problem is that site."
+    });
+    Ok(out)
+}
+
+#[tauri::command]
+fn diagnose_slow() -> Result<String, String> {
+    // biggest CPU users right now
+    let ps = sh("ps", &["-Areo", "pcpu,comm"]);
+    let mut procs: Vec<(f32, String)> = ps
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let t = l.trim();
+            let (cpu, comm) = t.split_once(' ')?;
+            let name = comm.trim().rsplit('/').next().unwrap_or(comm).to_string();
+            Some((cpu.trim().parse::<f32>().ok()?, name))
+        })
+        .collect();
+    procs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    procs.truncate(3);
+
+    let cores = sh("sysctl", &["-n", "hw.ncpu"]).trim().parse::<f32>().unwrap_or(1.0);
+    let load = sh("sysctl", &["-n", "vm.loadavg"])
+        .split_whitespace()
+        .nth(1)
+        .and_then(|x| x.parse::<f32>().ok())
+        .unwrap_or(0.0);
+    let swap_mb = sh("sysctl", &["-n", "vm.swapusage"])
+        .split("used = ")
+        .nth(1)
+        .and_then(|x| x.split('M').next())
+        .and_then(|x| x.trim().parse::<f32>().ok())
+        .unwrap_or(0.0);
+    let free_gb = {
+        let home = std::env::var("HOME").unwrap_or_default();
+        sh("df", &["-k", &home])
+            .lines()
+            .nth(1)
+            .and_then(|l| l.split_whitespace().nth(3))
+            .and_then(|x| x.parse::<f64>().ok())
+            .map(|kb| kb * 1024.0 / 1e9)
+            .unwrap_or(0.0)
+    };
+
+    let mut out = String::new();
+    out.push_str("Busiest right now:\n");
+    for (cpu, name) in &procs {
+        out.push_str(&format!("  {cpu:.0}% CPU  {name}\n"));
+    }
+    out.push_str(&format!(
+        "Load {load:.1} on {cores:.0} cores · swap {:.1} GB · disk {free_gb:.0} GB free\n",
+        swap_mb / 1024.0
+    ));
+    let hog = procs.first().filter(|(c, _)| *c > 80.0);
+    out.push_str(&if let Some((cpu, name)) = hog {
+        format!("→ {name} is eating {cpu:.0}% CPU — quitting it should help immediately.")
+    } else if load > cores * 1.5 {
+        "→ The whole machine is overloaded — close apps you're not using, or restart.".into()
+    } else if swap_mb / 1024.0 > 4.0 {
+        "→ Memory is the bottleneck (heavy swapping). Closing browser tabs and unused apps helps most.".into()
+    } else if free_gb < 15.0 {
+        "→ The disk is nearly full, which slows everything. Try \"disk space\".".into()
+    } else {
+        "→ Nothing obviously wrong right now. If it still feels slow, a restart clears most of it.".into()
+    });
+    Ok(out)
+}
+
+#[tauri::command]
+fn diagnose_audio() -> Result<String, String> {
+    let vol = sh("osascript", &["-e", "get volume settings"]);
+    let get = |key: &str| {
+        vol.split(&format!("{key}:"))
+            .nth(1)
+            .and_then(|x| x.split(&[',', '\n'][..]).next())
+            .map(|x| x.trim().to_string())
+            .unwrap_or_default()
+    };
+    let volume = get("output volume").parse::<i32>().unwrap_or(-1);
+    let muted = get("output muted") == "true";
+    let sp = sh("system_profiler", &["SPAudioDataType", "-detailLevel", "mini"]);
+    let output = sp
+        .split("Default Output Device: Yes")
+        .next()
+        .and_then(|before| {
+            before
+                .lines()
+                .rev()
+                .find(|l| l.ends_with(':') && !l.trim().is_empty() && !l.contains("Devices"))
+                .map(|l| l.trim().trim_end_matches(':').to_string())
+        })
+        .unwrap_or_else(|| "unknown".into());
+    let daemon_ok = !sh("pgrep", &["-x", "coreaudiod"]).trim().is_empty();
+
+    let mut out = format!(
+        "Output device: {output} · volume {volume}% · {}\n",
+        if muted { "MUTED" } else { "not muted" }
+    );
+    out.push_str(&if muted {
+        "→ Sound is muted — press F10 or raise the volume.".into()
+    } else if volume == 0 {
+        "→ Volume is at zero — turn it up.".into()
+    } else if !daemon_ok {
+        "→ The sound system (coreaudiod) isn't running — restarting the Mac fixes this.".into()
+    } else if output.to_lowercase().contains("display") || output.to_lowercase().contains("tv") {
+        format!("→ Sound is going to \"{output}\" (a screen), not speakers — switch the output device in Control Center.")
+    } else {
+        format!("→ Audio setup looks fine ({output}, {volume}%). If one app is silent, check its own volume; if everything is, try switching output devices in Control Center.")
+    });
+    Ok(out)
+}
+
 // --- Agent memory (SQLite, per spec) — first table: learned web destinations.
 
 fn mem_db(app: &AppHandle) -> Result<rusqlite::Connection, String> {
@@ -786,6 +955,9 @@ pub fn run() {
             search_files,
             rerank_files,
             diagnose_disk,
+            diagnose_wifi,
+            diagnose_slow,
+            diagnose_audio,
             plan_organize,
             apply_organize,
             undo_last,

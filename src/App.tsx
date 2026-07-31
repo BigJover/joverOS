@@ -109,7 +109,7 @@ type OrganizePlan = { summary: string; moves: PlannedMove[] };
 type Pending = { exec: () => Promise<string> };
 
 type Intent = {
-  intent: "app_launch" | "web_open" | "web_search" | "file_search" | "file_organize" | "troubleshoot" | "settings" | "empty_trash" | "unknown";
+  intent: "app_launch" | "web_open" | "web_search" | "file_search" | "file_organize" | "troubleshoot" | "settings" | "empty_trash" | "file_trash" | "unknown";
   app?: string;
   query?: string;
   url?: string;
@@ -208,6 +208,7 @@ const VERB_PINS: { verbs: string[]; intent: Intent["intent"] }[] = [
   { verbs: ["organize", "tidy", "clean up", "sort"], intent: "file_organize" },
   { verbs: ["disk space", "storage", "wifi", "internet"], intent: "troubleshoot" },
   { verbs: ["empty trash", "empty the trash", "take out the trash"], intent: "empty_trash" },
+  { verbs: ["trash", "delete", "remove"], intent: "file_trash" },
 ];
 
 // sound/volume/brightness lead-words: with an action they're a settings
@@ -236,6 +237,7 @@ function verbPin(input: string): Intent | null {
       if (intent === "file_search") rest = rest.replace(/^(my|the)\s+/i, "");
       if (intent === "app_launch") return { intent, app: rest };
       if (intent === "troubleshoot") return { intent, query: v };
+      if (intent === "file_trash") rest = rest.replace(/^(my|the|that|this)\s+/i, "");
       return { intent, query: rest };
     }
   }
@@ -297,7 +299,7 @@ function App() {
     setStatus("");
     try {
       // "undo" is a reserved word: straight to the log, no model.
-      if (input.trim().toLowerCase() === "undo") {
+      if (/^(undo|put (it |that )?back|restore trash)$/i.test(input.trim())) {
         setReply(await invoke<string>("undo_last"));
         return;
       }
@@ -405,6 +407,34 @@ function App() {
           : ["diagnose_disk", "disk"];
         setStatus(`checking ${what}…`);
         setReply(await invoke<string>(cmd));
+      } else if (intent.intent === "file_trash") {
+        const what = (intent.query ?? "").trim();
+        if (!what) {
+          setReply("Trash what? Name the file — like “trash old notes”.");
+        } else {
+          const { terms, kind, since, until } = parseSearch(what);
+          setStatus(`finding ${terms || what}…`);
+          const hits = await invoke<FileHit[]>("search_files", {
+            query: terms || what,
+            kind,
+            since,
+            until,
+            order: null,
+          });
+          if (hits.length === 0) {
+            setReply(`No file matching “${what}”.`);
+          } else {
+            const top = hits[0];
+            const more =
+              hits.length > 1
+                ? ` (${hits.length - 1} other match${hits.length === 2 ? "" : "es"} — be more specific if this isn't it)`
+                : "";
+            setPending({ exec: () => invoke<string>("trash_file", { path: top.path }) });
+            setReply(
+              `Move “${top.name}” to Trash?\n${top.path.replace(/^\/Users\/[^/]+/, "~")}\nEnter to confirm — undo puts it back. Esc to cancel.${more}`
+            );
+          }
+        }
       } else if (intent.intent === "empty_trash") {
         const n = await invoke<number>("trash_count");
         if (n === 0) {

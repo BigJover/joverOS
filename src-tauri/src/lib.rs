@@ -82,8 +82,9 @@ For web_open and web_search: if the user names a browser (e.g. chrome, safari, f
 - file_organize: the user wants to tidy/organize/sort a folder's files into subfolders (moving only, never deleting). Set \"query\" to the folder name (e.g. downloads, desktop).\n\
 - troubleshoot: the user reports a computer problem to diagnose — disk full, wifi/internet not working, computer running slow, sound/audio not working. Set \"query\" to the problem area: disk, wifi, slow, or audio.\n\
 - empty_trash: the user wants to empty the trash/bin for good.\n\
+- file_trash: the user wants to delete a specific file or folder, or move it to the trash. Set \"query\" to words identifying the file.\n\
 - settings: the user wants to change the sound volume or screen brightness (\"turn it down\", \"volume 30\", \"dim the screen\", \"mute\"). Set \"query\" to: volume or brightness, then a 0-100 number or up/down/max/mute/unmute.\n\
-- unknown: anything else — including deleting specific files, changing other settings, or installing software. Set \"reply\" to one short sentence stating you can't do that yet.\n\
+- unknown: anything else — including changing other settings or installing software. Set \"reply\" to one short sentence stating you can't do that yet.\n\
 Respond with JSON only.";
 
 // One structured-output call to the local model: the schema means it can
@@ -119,7 +120,7 @@ async fn route_intent(input: String) -> Result<Intent, String> {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
-            "intent": { "type": "string", "enum": ["app_launch", "web_open", "web_search", "file_search", "file_organize", "troubleshoot", "settings", "empty_trash", "unknown"] },
+            "intent": { "type": "string", "enum": ["app_launch", "web_open", "web_search", "file_search", "file_organize", "troubleshoot", "settings", "empty_trash", "file_trash", "unknown"] },
             "app": { "type": "string" },
             "query": { "type": "string" },
             "url": { "type": "string" },
@@ -471,6 +472,21 @@ fn undo_last(app: AppHandle) -> Result<String, String> {
     let mut back = 0usize;
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
     for (src, dst) in &rows {
+        // journaled trashing: ask Finder to move the item home again
+        if let Some(name) = dst.strip_prefix("trash:") {
+            let Some(parent) = Path::new(src).parent().map(|p| p.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            let out = osa(&format!(
+                "tell application \"Finder\" to move (first item of trash whose name is \"{}\") to (POSIX file \"{}\" as alias)",
+                name.replace('"', "\\\""),
+                parent.replace('"', "\\\"")
+            ));
+            if !out.to_lowercase().contains("error") {
+                back += 1;
+            }
+            continue;
+        }
         let (s, d) = (Path::new(src), Path::new(dst));
         if d.is_file() && !s.exists() && std::fs::rename(d, s).is_ok() {
             back += 1;
@@ -837,6 +853,38 @@ fn set_brightness(action: String) -> Result<String, String> {
     }
 }
 
+// Trashing a file is the reversible delete: Finder does the move (its
+// own Put Back keeps working) and the op is journaled in file_ops with a
+// trash: marker so our "undo" can restore it to where it lived.
+#[tauri::command]
+fn trash_file(app: AppHandle, path: String) -> Result<String, String> {
+    let name = Path::new(&path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .ok_or("bad path")?;
+    let out = osa(&format!(
+        "tell application \"Finder\" to delete POSIX file \"{}\"",
+        path.replace('"', "\\\"")
+    ));
+    if out.to_lowercase().contains("error") {
+        return Err(format!("Finder wouldn't trash it: {}", out.trim()));
+    }
+    let conn = mem_db(&app)?;
+    let batch: i64 = conn
+        .query_row("SELECT COALESCE(MAX(batch), 0) + 1 FROM file_ops", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO file_ops (batch, src, dst) VALUES (?1, ?2, ?3)",
+        rusqlite::params![batch, path, format!("trash:{name}")],
+    )
+    .map_err(|e| e.to_string())?;
+    let _ = conn.execute(
+        "INSERT INTO history (action, detail) VALUES ('trash_file', ?1)",
+        [&name],
+    );
+    Ok(format!("Moved {name} to Trash — undo puts it back."))
+}
+
 // --- Empty trash (M3): the first destructive action, so it sets the
 // pattern — count first, confirm in the bar, go through Finder (macOS
 // asks its own one-time consent for that), record it in history.
@@ -1101,6 +1149,7 @@ pub fn run() {
             diagnose_wifi,
             diagnose_slow,
             diagnose_audio,
+            trash_file,
             trash_count,
             empty_trash,
             set_volume,

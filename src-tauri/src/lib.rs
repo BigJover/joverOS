@@ -160,7 +160,11 @@ fn mdfind(args: &[&str]) -> Vec<String> {
 
 // caches, dependencies, dotfolders — machinery, not the user's files
 fn noise(p: &str) -> bool {
-    p.contains("/Library/") || p.contains("/node_modules/") || p.contains("/.")
+    p.contains("/Library/")
+        || p.contains("/node_modules/")
+        || p.contains("/venv/")
+        || p.contains("/site-packages/")
+        || p.contains("/.")
 }
 
 fn add_hits(list: Vec<String>, paths: &mut Vec<String>, cap: usize) {
@@ -197,6 +201,27 @@ fn search_files(query: String, kind: Option<String>, since: Option<i64>, until: 
         tiers[0] = paths.len();
         if stemmed != query {
             add_hits(mdfind(&["-onlyin", &home, "-name", &stemmed]), &mut paths, cap);
+        }
+        // A typed extension is a hint, not a requirement: "eva.jpeg" must
+        // still find eva.jpg. Strip known extensions and search the bare
+        // name in the same tier.
+        let bare: String = query
+            .split_whitespace()
+            .map(|w| match w.rsplit_once('.') {
+                Some((base, ext))
+                    if !base.is_empty()
+                        && CATEGORIES
+                            .iter()
+                            .any(|(_, exts)| exts.contains(&ext.to_lowercase().as_str())) =>
+                {
+                    base
+                }
+                _ => w,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        if bare != query && bare != stemmed {
+            add_hits(mdfind(&["-onlyin", &home, "-name", &bare]), &mut paths, cap);
         }
         tiers[1] = paths.len();
     }

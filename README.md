@@ -35,6 +35,7 @@ Certain first words pin what happens, deterministically — no model, no guessin
 | `organize downloads` / `tidy desktop` | plan a **by-type cleanup**, shown first — nothing moves until you press Enter |
 | `undo` | **reverse** the last file operation |
 | `disk space` / `wifi` / `sound` / "why is my mac slow" | **diagnose** the problem, layer by layer |
+| `sound 15` / `volume up` / `mute` / `brightness 70` | **set** volume or brightness — loose: `sound 15`, `sound volume 15%`, "dim the screen" all work |
 
 Everything else is free-form — the local model figures out what you meant.
 

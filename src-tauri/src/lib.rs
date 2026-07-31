@@ -81,7 +81,8 @@ For web_open and web_search: if the user names a browser (e.g. chrome, safari, f
 - file_search: the user wants to FIND files, documents, or folders on this computer (finding only, no changes). Set \"query\" to only the words likely in the file's name or contents — drop filler like \"find\", \"my\", \"that\", \"file\".\n\
 - file_organize: the user wants to tidy/organize/sort a folder's files into subfolders (moving only, never deleting). Set \"query\" to the folder name (e.g. downloads, desktop).\n\
 - troubleshoot: the user reports a computer problem to diagnose — disk full, wifi/internet not working, computer running slow, sound/audio not working. Set \"query\" to the problem area: disk, wifi, slow, or audio.\n\
-- unknown: anything else — including deleting files, emptying trash, changing settings, or installing software. Set \"reply\" to one short sentence stating you can't do that yet.\n\
+- settings: the user wants to change the sound volume or screen brightness (\"turn it down\", \"volume 30\", \"dim the screen\", \"mute\"). Set \"query\" to: volume or brightness, then a 0-100 number or up/down/max/mute/unmute.\n\
+- unknown: anything else — including deleting files, emptying trash, changing other settings, or installing software. Set \"reply\" to one short sentence stating you can't do that yet.\n\
 Respond with JSON only.";
 
 // One structured-output call to the local model: the schema means it can
@@ -117,7 +118,7 @@ async fn route_intent(input: String) -> Result<Intent, String> {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
-            "intent": { "type": "string", "enum": ["app_launch", "web_open", "web_search", "file_search", "file_organize", "troubleshoot", "unknown"] },
+            "intent": { "type": "string", "enum": ["app_launch", "web_open", "web_search", "file_search", "file_organize", "troubleshoot", "settings", "unknown"] },
             "app": { "type": "string" },
             "query": { "type": "string" },
             "url": { "type": "string" },
@@ -751,6 +752,90 @@ fn diagnose_audio() -> Result<String, String> {
     Ok(out)
 }
 
+// --- Settings (M3): volume and brightness. These run without a confirm
+// step deliberately: the command itself names the exact change ("sound
+// 15"), it applies instantly, and the same command reverses it — the
+// confirmation layer is for operations the agent plans on your behalf.
+
+fn osa(script: &str) -> String {
+    sh("osascript", &["-e", script])
+}
+
+fn level_from(action: &str, current: impl Fn() -> i32) -> Result<i32, String> {
+    Ok(match action {
+        "up" => current() + 10,
+        "down" => current() - 10,
+        "max" => 100,
+        "min" => 0,
+        n => n
+            .parse::<i32>()
+            .map_err(|_| format!("didn't catch a level in {n:?} — try a number 0-100"))?,
+    }
+    .clamp(0, 100))
+}
+
+#[tauri::command]
+fn set_volume(action: String) -> Result<String, String> {
+    match action.as_str() {
+        "mute" => {
+            osa("set volume output muted true");
+            return Ok("Muted.".into());
+        }
+        "unmute" => {
+            osa("set volume output muted false");
+            return Ok("Unmuted.".into());
+        }
+        _ => {}
+    }
+    let target = level_from(&action, || {
+        osa("output volume of (get volume settings)").trim().parse().unwrap_or(50)
+    })?;
+    osa(&format!("set volume output volume {target}"));
+    // asking for a level means you want to hear it
+    if target > 0 {
+        osa("set volume output muted false");
+    }
+    Ok(format!("Volume {target}%."))
+}
+
+// No public API for brightness — this is the same private DisplayServices
+// call the settings daemon uses (verified on this hardware). Fails soft.
+#[tauri::command]
+fn set_brightness(action: String) -> Result<String, String> {
+    unsafe {
+        let cg = libc::dlopen(
+            c"/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics".as_ptr(),
+            libc::RTLD_LAZY,
+        );
+        let ds = libc::dlopen(
+            c"/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices".as_ptr(),
+            libc::RTLD_LAZY,
+        );
+        if cg.is_null() || ds.is_null() {
+            return Err("brightness control isn't available on this Mac".into());
+        }
+        let sym_main = libc::dlsym(cg, c"CGMainDisplayID".as_ptr());
+        let sym_get = libc::dlsym(ds, c"DisplayServicesGetBrightness".as_ptr());
+        let sym_set = libc::dlsym(ds, c"DisplayServicesSetBrightness".as_ptr());
+        if sym_main.is_null() || sym_get.is_null() || sym_set.is_null() {
+            return Err("brightness control isn't available on this Mac".into());
+        }
+        let main_id: extern "C" fn() -> u32 = std::mem::transmute(sym_main);
+        let get: extern "C" fn(u32, *mut f32) -> i32 = std::mem::transmute(sym_get);
+        let set: extern "C" fn(u32, f32) -> i32 = std::mem::transmute(sym_set);
+        let id = main_id();
+        let target = level_from(&action, || {
+            let mut cur = 0.5f32;
+            get(id, &mut cur);
+            (cur * 100.0).round() as i32
+        })?;
+        if set(id, target as f32 / 100.0) != 0 {
+            return Err("this display doesn't allow brightness control".into());
+        }
+        Ok(format!("Brightness {target}%."))
+    }
+}
+
 // --- Agent memory (SQLite, per spec) — first table: learned web destinations.
 
 fn mem_db(app: &AppHandle) -> Result<rusqlite::Connection, String> {
@@ -972,6 +1057,8 @@ pub fn run() {
             diagnose_wifi,
             diagnose_slow,
             diagnose_audio,
+            set_volume,
+            set_brightness,
             plan_organize,
             apply_organize,
             undo_last,

@@ -106,7 +106,7 @@ type PlannedMove = { from: string; to: string };
 type OrganizePlan = { summary: string; moves: PlannedMove[] };
 
 type Intent = {
-  intent: "app_launch" | "web_open" | "web_search" | "file_search" | "file_organize" | "troubleshoot" | "unknown";
+  intent: "app_launch" | "web_open" | "web_search" | "file_search" | "file_organize" | "troubleshoot" | "settings" | "unknown";
   app?: string;
   query?: string;
   url?: string;
@@ -175,6 +175,25 @@ function siteFromInput(
   return site && rest ? { name, site, rest } : null;
 }
 
+// Loose settings parsing: "sound volume 15%", "sound 15", "volume up",
+// "brightness 70" all resolve the same. A number wins; otherwise a
+// direction word; bare "sound" stays a diagnosis, not a change.
+const SET_ACTIONS: Record<string, string> = {
+  up: "up", higher: "up", louder: "up", raise: "up", increase: "up", brighter: "up",
+  down: "down", lower: "down", quieter: "down", decrease: "down", dim: "down", dimmer: "down", darker: "down",
+  max: "max", maximum: "max", full: "max", min: "min", minimum: "min", zero: "min",
+  mute: "mute", muted: "mute", silence: "mute", unmute: "unmute",
+};
+
+function parseSetAction(text: string): string | null {
+  const num = text.match(/(\d{1,3})\s*%?/);
+  if (num) return String(Math.min(100, parseInt(num[1], 10)));
+  for (const w of text.toLowerCase().split(/\s+/)) {
+    if (SET_ACTIONS[w]) return SET_ACTIONS[w];
+  }
+  return null;
+}
+
 // Verb shortcuts: leading command words that pin the intent outright — a
 // small vocabulary the user can rely on, instant and misroute-proof (no
 // model call). Free-form phrasing still falls through to the router.
@@ -184,11 +203,28 @@ const VERB_PINS: { verbs: string[]; intent: Intent["intent"] }[] = [
   { verbs: ["search for", "search", "look up", "lookup"], intent: "web_search" },
   { verbs: ["launch", "open app"], intent: "app_launch" },
   { verbs: ["organize", "tidy", "clean up", "sort"], intent: "file_organize" },
-  { verbs: ["disk space", "storage", "wifi", "internet", "audio", "sound"], intent: "troubleshoot" },
+  { verbs: ["disk space", "storage", "wifi", "internet"], intent: "troubleshoot" },
 ];
+
+// sound/volume/brightness lead-words: with an action they're a settings
+// change, bare they fall through (sound -> audio diagnosis).
+const SETTING_TARGETS: Record<string, string> = {
+  sound: "volume", volume: "volume", audio: "volume", mute: "volume", unmute: "volume",
+  brightness: "brightness", display: "brightness", screen: "brightness",
+};
 
 function verbPin(input: string): Intent | null {
   const lower = input.toLowerCase();
+  const first = lower.split(/\s+/)[0];
+  const target = SETTING_TARGETS[first];
+  if (target) {
+    const rest = input.slice(first.length).trim();
+    const action =
+      first === "mute" || first === "unmute" ? first : parseSetAction(rest);
+    if (action) return { intent: "settings", query: `${target} ${action}` };
+    if (first === "sound" || first === "audio" || first === "volume")
+      return { intent: "troubleshoot", query: "audio" };
+  }
   for (const { verbs, intent } of VERB_PINS) {
     for (const v of verbs) {
       if (lower !== v && !lower.startsWith(v + " ")) continue;
@@ -365,6 +401,15 @@ function App() {
           : ["diagnose_disk", "disk"];
         setStatus(`checking ${what}…`);
         setReply(await invoke<string>(cmd));
+      } else if (intent.intent === "settings") {
+        const q = (intent.query ?? input).toLowerCase();
+        const target = /bright|display|screen/.test(q) ? "set_brightness" : "set_volume";
+        const action = parseSetAction(q);
+        if (!action) {
+          setReply('Say a level — like "sound 30", "volume up", or "brightness 70".');
+        } else {
+          setReply(await invoke<string>(target, { action }));
+        }
       } else if (intent.intent === "file_organize") {
         const p = await invoke<OrganizePlan>("plan_organize", {
           folder: intent.query ?? input,

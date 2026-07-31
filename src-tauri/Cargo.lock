@@ -1955,6 +1955,7 @@ dependencies = [
 name = "joveros"
 version = "0.2.0"
 dependencies = [
+ "libc",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",

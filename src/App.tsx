@@ -105,8 +105,11 @@ function parseSearch(raw: string): ParsedSearch {
 type PlannedMove = { from: string; to: string };
 type OrganizePlan = { summary: string; moves: PlannedMove[] };
 
+// Anything the agent plans on the user's behalf waits here for Enter.
+type Pending = { exec: () => Promise<string> };
+
 type Intent = {
-  intent: "app_launch" | "web_open" | "web_search" | "file_search" | "file_organize" | "troubleshoot" | "settings" | "unknown";
+  intent: "app_launch" | "web_open" | "web_search" | "file_search" | "file_organize" | "troubleshoot" | "settings" | "empty_trash" | "unknown";
   app?: string;
   query?: string;
   url?: string;
@@ -204,6 +207,7 @@ const VERB_PINS: { verbs: string[]; intent: Intent["intent"] }[] = [
   { verbs: ["launch", "open app"], intent: "app_launch" },
   { verbs: ["organize", "tidy", "clean up", "sort"], intent: "file_organize" },
   { verbs: ["disk space", "storage", "wifi", "internet"], intent: "troubleshoot" },
+  { verbs: ["empty trash", "empty the trash", "take out the trash"], intent: "empty_trash" },
 ];
 
 // sound/volume/brightness lead-words: with an action they're a settings
@@ -259,7 +263,7 @@ function App() {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
   const [files, setFiles] = useState<FileHit[]>([]);
-  const [plan, setPlan] = useState<OrganizePlan | null>(null);
+  const [pending, setPending] = useState<Pending | null>(null);
   const [thinking, setThinking] = useState(false);
   const [status, setStatus] = useState("");
   const [reply, setReply] = useState("");
@@ -271,7 +275,7 @@ function App() {
       setQuery("");
       setSelected(0);
       setFiles([]);
-      setPlan(null);
+      setPending(null);
       setThinking(false);
       setStatus("");
       setReply("");
@@ -401,6 +405,16 @@ function App() {
           : ["diagnose_disk", "disk"];
         setStatus(`checking ${what}…`);
         setReply(await invoke<string>(cmd));
+      } else if (intent.intent === "empty_trash") {
+        const n = await invoke<number>("trash_count");
+        if (n === 0) {
+          setReply("Trash is already empty.");
+        } else {
+          setPending({ exec: () => invoke<string>("empty_trash") });
+          setReply(
+            `Trash has ${n} item${n === 1 ? "" : "s"} — Enter to empty it for good (this can't be undone), Esc to cancel.`
+          );
+        }
       } else if (intent.intent === "settings") {
         const q = (intent.query ?? input).toLowerCase();
         const target = /bright|display|screen/.test(q) ? "set_brightness" : "set_volume";
@@ -417,7 +431,7 @@ function App() {
         if (p.moves.length === 0) {
           setReply("Nothing loose to organize there.");
         } else {
-          setPlan(p);
+          setPending({ exec: () => invoke<string>("apply_organize", { moves: p.moves }) });
           setReply(`${p.summary} — Enter to do it, Esc to cancel.`);
         }
       } else if (intent.intent === "file_search") {
@@ -464,18 +478,16 @@ function App() {
   };
 
   const onKeyDown = (e: React.KeyboardEvent) => {
-    // A pending plan owns the keyboard: nothing moves without Enter here.
-    if (plan) {
+    // A pending action owns the keyboard: nothing happens without Enter here.
+    if (pending) {
       if (e.key === "Enter") {
-        const moves = plan.moves;
-        setPlan(null);
+        const { exec } = pending;
+        setPending(null);
         setReply("working…");
-        invoke<string>("apply_organize", { moves })
-          .then(setReply)
-          .catch((err) => setReply(String(err)));
+        exec().then(setReply).catch((err) => setReply(String(err)));
       } else if (e.key === "Escape") {
-        setPlan(null);
-        setReply("Cancelled — nothing moved.");
+        setPending(null);
+        setReply("Cancelled — nothing changed.");
       }
       return;
     }
@@ -510,7 +522,7 @@ function App() {
           setQuery(e.target.value);
           setSelected(0);
           setFiles([]);
-          setPlan(null);
+          setPending(null);
           setReply("");
         }}
       />

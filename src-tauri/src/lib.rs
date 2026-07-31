@@ -81,8 +81,9 @@ For web_open and web_search: if the user names a browser (e.g. chrome, safari, f
 - file_search: the user wants to FIND files, documents, or folders on this computer (finding only, no changes). Set \"query\" to only the words likely in the file's name or contents — drop filler like \"find\", \"my\", \"that\", \"file\".\n\
 - file_organize: the user wants to tidy/organize/sort a folder's files into subfolders (moving only, never deleting). Set \"query\" to the folder name (e.g. downloads, desktop).\n\
 - troubleshoot: the user reports a computer problem to diagnose — disk full, wifi/internet not working, computer running slow, sound/audio not working. Set \"query\" to the problem area: disk, wifi, slow, or audio.\n\
+- empty_trash: the user wants to empty the trash/bin for good.\n\
 - settings: the user wants to change the sound volume or screen brightness (\"turn it down\", \"volume 30\", \"dim the screen\", \"mute\"). Set \"query\" to: volume or brightness, then a 0-100 number or up/down/max/mute/unmute.\n\
-- unknown: anything else — including deleting files, emptying trash, changing other settings, or installing software. Set \"reply\" to one short sentence stating you can't do that yet.\n\
+- unknown: anything else — including deleting specific files, changing other settings, or installing software. Set \"reply\" to one short sentence stating you can't do that yet.\n\
 Respond with JSON only.";
 
 // One structured-output call to the local model: the schema means it can
@@ -118,7 +119,7 @@ async fn route_intent(input: String) -> Result<Intent, String> {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
-            "intent": { "type": "string", "enum": ["app_launch", "web_open", "web_search", "file_search", "file_organize", "troubleshoot", "settings", "unknown"] },
+            "intent": { "type": "string", "enum": ["app_launch", "web_open", "web_search", "file_search", "file_organize", "troubleshoot", "settings", "empty_trash", "unknown"] },
             "app": { "type": "string" },
             "query": { "type": "string" },
             "url": { "type": "string" },
@@ -836,12 +837,55 @@ fn set_brightness(action: String) -> Result<String, String> {
     }
 }
 
+// --- Empty trash (M3): the first destructive action, so it sets the
+// pattern — count first, confirm in the bar, go through Finder (macOS
+// asks its own one-time consent for that), record it in history.
+// Deleting is exactly what the undo log can NOT reverse, and the
+// confirm text says so.
+
+#[tauri::command]
+fn trash_count() -> Result<i64, String> {
+    let out = osa("tell application \"Finder\" to count items in trash");
+    out.trim()
+        .parse()
+        .map_err(|_| format!("couldn't check the Trash — macOS may have blocked Finder access ({})", out.trim()))
+}
+
+#[tauri::command]
+fn empty_trash(app: AppHandle) -> Result<String, String> {
+    let n = trash_count()?;
+    if n == 0 {
+        return Ok("Trash is already empty.".into());
+    }
+    let out = osa("tell application \"Finder\" to empty trash");
+    if out.to_lowercase().contains("error") {
+        return Err(format!("Finder wouldn't empty the trash: {}", out.trim()));
+    }
+    if let Ok(conn) = mem_db(&app) {
+        let _ = conn.execute(
+            "INSERT INTO history (action, detail) VALUES ('empty_trash', ?1)",
+            [format!("{n} items")],
+        );
+    }
+    Ok(format!("Emptied the Trash — {n} items gone for good."))
+}
+
 // --- Agent memory (SQLite, per spec) — first table: learned web destinations.
 
 fn mem_db(app: &AppHandle) -> Result<rusqlite::Connection, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let conn = rusqlite::Connection::open(dir.join("memory.db")).map_err(|e| e.to_string())?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            ts TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS file_ops (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1057,6 +1101,8 @@ pub fn run() {
             diagnose_wifi,
             diagnose_slow,
             diagnose_audio,
+            trash_count,
+            empty_trash,
             set_volume,
             set_brightness,
             plan_organize,

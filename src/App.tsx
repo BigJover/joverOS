@@ -60,7 +60,7 @@ function timeWindow(phrase: string): [number, number | null] | null {
 }
 
 // dangling connectives left behind once determiners are stripped
-const FILLER = new Set(["from", "of", "the", "my", "a", "an", "in", "that"]);
+const FILLER = new Set(["from", "of", "to", "the", "my", "a", "an", "in", "that"]);
 
 type ParsedSearch = {
   terms: string;
@@ -218,7 +218,14 @@ const SETTING_TARGETS: Record<string, string> = {
   brightness: "brightness", display: "brightness", screen: "brightness",
 };
 
+// "move X to the trash" / "throw away X" have exactly one meaning — no
+// model needed, and the model sometimes reads "move" as folder-organize.
+const TRASH_PHRASE = /^(?:move|put|send|throw|chuck|drag)\s+(.+?)\s+(?:into|to|in)\s+(?:the\s+)?(?:trash|bin)$/i;
+const THROW_AWAY = /^(?:throw away|throw out|get rid of|dispose of)\s+(.+)$/i;
+
 function verbPin(input: string): Intent | null {
+  const phrase = input.match(TRASH_PHRASE) ?? input.match(THROW_AWAY);
+  if (phrase) return { intent: "file_trash", query: phrase[1] };
   const lower = input.toLowerCase();
   const first = lower.split(/\s+/)[0];
   const target = SETTING_TARGETS[first];
@@ -413,7 +420,12 @@ function App() {
         setStatus(`checking ${what}…`);
         setReply(await invoke<string>(cmd));
       } else if (intent.intent === "file_trash") {
-        const what = (intent.query ?? "").trim();
+        // whatever routed us here, scrub trash-talk and fillers so only
+        // the file description reaches the search
+        const what = (intent.query ?? "")
+          .replace(/\s+(?:into|to|in)\s+(?:the\s+)?(?:trash|bin)\s*$/i, "")
+          .replace(/^(?:my|the|that|this)\s+/i, "")
+          .trim();
         if (!what) {
           setReply("Trash what? Name the file — like “trash old notes”.");
         } else {

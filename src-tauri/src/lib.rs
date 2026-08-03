@@ -910,6 +910,76 @@ fn trash_file(app: AppHandle, path: String) -> Result<String, String> {
     Ok(format!("Moved {name} to Trash — undo puts it back."))
 }
 
+// macOS protects the Trash: Finder will script items IN but refuses to
+// move them OUT (error -5000) unless the caller has Full Disk Access.
+// So restoring tries the direct route first (instant with FDA), then
+// Finder, and if both are blocked says exactly which switch to flip.
+// Ok(true) = home again (or already was); Ok(false) = blocked.
+fn restore_one(conn: &rusqlite::Connection, id: i64, src: &str, name: &str) -> bool {
+    if Path::new(src).exists() {
+        // already back (Finder Put Back, or a re-download) — row is stale
+        let _ = conn.execute("DELETE FROM file_ops WHERE id = ?1", [id]);
+        return true;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let restored = std::fs::rename(format!("{home}/.Trash/{name}"), src).is_ok() || {
+        let out = osa(&format!(
+            "tell application \"Finder\" to move (first item of trash whose name is \"{}\") to (POSIX file \"{}\" as alias)",
+            name.replace('"', "\\\""),
+            Path::new(src).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default().replace('"', "\\\"")
+        ));
+        !out.to_lowercase().contains("error")
+    };
+    if restored {
+        let _ = conn.execute("DELETE FROM file_ops WHERE id = ?1", [id]);
+        let _ = conn.execute(
+            "INSERT INTO history (action, detail) VALUES ('restore', ?1)",
+            [name],
+        );
+    }
+    restored
+}
+
+const FDA_HINT: &str = "macOS protects the Trash from apps. Either use Finder's File → Put Back (⌘⌫), or grant joverOS Full Disk Access once (System Settings → Privacy & Security → Full Disk Access) and I can restore directly from then on.";
+
+// Put one named thing back: "put eva back", "restore eva.jpg".
+#[tauri::command]
+fn restore_named(app: AppHandle, what: String) -> Result<String, String> {
+    let conn = mem_db(&app)?;
+    let rows: Vec<(i64, String, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, src, dst FROM file_ops WHERE dst LIKE 'trash:%' ORDER BY id DESC")
+            .map_err(|e| e.to_string())?;
+        let r = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
+        r
+    };
+    let q = what.trim().to_lowercase();
+    let stem = q.rsplit_once('.').map(|(b, _)| b.to_string()).unwrap_or_else(|| q.clone());
+    let hit = rows.iter().find(|(_, _, dst)| {
+        let name = dst.strip_prefix("trash:").unwrap_or(dst).to_lowercase();
+        name.contains(&q) || name.contains(&stem)
+    });
+    let Some((id, src, dst)) = hit else {
+        // maybe it's in the trash, just not ours
+        let names = osa("tell application \"Finder\" to get name of items in trash").to_lowercase();
+        return Ok(if names.contains(&stem) {
+            format!("“{what}” is in the Trash, but it wasn't me who put it there — only Finder knows where it came from. {FDA_HINT}")
+        } else {
+            format!("I don't have “{what}” in my trash journal, and nothing like it is in the Trash.")
+        });
+    };
+    let name = dst.strip_prefix("trash:").unwrap_or(dst).to_string();
+    if restore_one(&conn, *id, src, &name) {
+        Ok(format!("Put {name} back — {}", src.replacen(&std::env::var("HOME").unwrap_or_default(), "~", 1)))
+    } else {
+        Ok(format!("Couldn't pull {name} out of the Trash. {FDA_HINT}"))
+    }
+}
+
 // "restore trash" restores everything the bar itself trashed that is
 // still in the Trash — any batch, not just the last. Items trashed in
 // Finder can't be bulk-restored by anyone but Finder: their original
@@ -930,43 +1000,38 @@ fn restore_trash(app: AppHandle) -> Result<String, String> {
         r
     };
     let mut back = 0usize;
+    let mut blocked = 0usize;
     for (id, src, dst) in &rows {
         let Some(name) = dst.strip_prefix("trash:") else { continue };
-        let Some(parent) = Path::new(src).parent().map(|p| p.to_string_lossy().into_owned()) else {
-            continue;
-        };
-        let out = osa(&format!(
-            "tell application \"Finder\" to move (first item of trash whose name is \"{}\") to (POSIX file \"{}\" as alias)",
-            name.replace('"', "\\\""),
-            parent.replace('"', "\\\"")
-        ));
-        if !out.to_lowercase().contains("error") {
+        if restore_one(&conn, *id, src, name) {
             back += 1;
-            let _ = conn.execute("DELETE FROM file_ops WHERE id = ?1", [id]);
+        } else {
+            blocked += 1;
         }
     }
-    if back > 0 {
-        let _ = conn.execute(
-            "INSERT INTO history (action, detail) VALUES ('restore_trash', ?1)",
-            [format!("{back} items")],
-        );
-    }
     let remaining = trash_count().unwrap_or(0);
-    Ok(match (back, remaining) {
-        (0, 0) => "Trash is empty — nothing to restore.".into(),
-        (0, n) => format!(
-            "The {n} item{} in the Trash {} put there in Finder, not by me — only Finder knows where {} came from. Open the Trash and use File → Put Back (⌘⌫).",
-            if n == 1 { "" } else { "s" },
-            if n == 1 { "was" } else { "were" },
-            if n == 1 { "it" } else { "they" }
-        ),
-        (b, 0) => format!("Put {b} file{} back where {} lived.", if b == 1 { "" } else { "s" }, if b == 1 { "it" } else { "they" }),
-        (b, n) => format!(
-            "Put {b} file{} back. {n} more {} trashed in Finder — File → Put Back (⌘⌫) there restores {}.",
-            if b == 1 { "" } else { "s" },
-            if n == 1 { "was" } else { "were" },
-            if n == 1 { "it" } else { "them" }
-        ),
+    Ok(if blocked > 0 {
+        format!(
+            "Restored {back}, but {blocked} of mine {} stuck in the Trash. {FDA_HINT}",
+            if blocked == 1 { "is" } else { "are" }
+        )
+    } else {
+        match (back, remaining) {
+            (0, 0) => "Trash is empty — nothing to restore.".into(),
+            (0, n) => format!(
+                "The {n} item{} in the Trash {} put there in Finder, not by me — only Finder knows where {} came from. Use Finder's File → Put Back (⌘⌫), or grant joverOS Full Disk Access and I can do it.",
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "was" } else { "were" },
+                if n == 1 { "it" } else { "they" }
+            ),
+            (b, 0) => format!("Put {b} file{} back where {} lived.", if b == 1 { "" } else { "s" }, if b == 1 { "it" } else { "they" }),
+            (b, n) => format!(
+                "Put {b} file{} back. {n} more {} trashed in Finder — File → Put Back (⌘⌫) there restores {}.",
+                if b == 1 { "" } else { "s" },
+                if n == 1 { "was" } else { "were" },
+                if n == 1 { "it" } else { "them" }
+            ),
+        }
     })
 }
 
@@ -1236,6 +1301,7 @@ pub fn run() {
             diagnose_audio,
             trash_file,
             restore_trash,
+            restore_named,
             trash_count,
             empty_trash,
             set_volume,

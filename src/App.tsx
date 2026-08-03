@@ -315,6 +315,15 @@ function App() {
         setReply(await invoke<string>("restore_trash"));
         return;
       }
+      // named restore: "put eva.jpg back", "restore eva", "bring back eva"
+      const named =
+        input.trim().match(/^(?:put|move|bring)\s+(.+?)\s+back$/i) ??
+        input.trim().match(/^(?:restore|bring back|recover)\s+(.+)$/i);
+      if (named && !/^(it|that|this|them)$/i.test(named[1])) {
+        const what = named[1].replace(/^(?:my|the)\s+/i, "");
+        setReply(await invoke<string>("restore_named", { what }));
+        return;
+      }
 
       // Browser choice is decided from the raw input only — the model's
       // "app" field is ignored (it sometimes holds the site name, e.g.

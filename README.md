@@ -35,6 +35,7 @@ Certain first words pin what happens, deterministically — no model, no guessin
 | `chrome …` / `firefox …` / `safari …` first word, or `… in firefox` | use **that browser** |
 | `organize downloads` / `tidy desktop` | plan a **by-type cleanup**, shown first — nothing moves until you press Enter |
 | `undo` | **reverse** the last file operation |
+| `put eva.jpg back` / `restore eva` / `restore trash` | **restore** trashed files — one by name, or everything the bar trashed |
 | `trash <file>` / `delete <file>` | move a file **to the Trash** — shows which file first, Enter confirms, `undo` puts it back |
 | `empty trash` | count what's there, then **empty it** — only after you press Enter |
 | `disk space` / `wifi` / `sound` / "why is my mac slow" | **diagnose** the problem, layer by layer |

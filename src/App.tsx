@@ -109,7 +109,7 @@ type OrganizePlan = { summary: string; moves: PlannedMove[] };
 type Pending = { exec: () => Promise<string> };
 
 type Intent = {
-  intent: "app_launch" | "web_open" | "web_search" | "file_search" | "file_organize" | "troubleshoot" | "settings" | "empty_trash" | "file_trash" | "file_delete" | "unknown";
+  intent: "app_launch" | "web_open" | "web_search" | "file_search" | "file_organize" | "troubleshoot" | "settings" | "empty_trash" | "file_trash" | "file_delete" | "history" | "unknown";
   app?: string;
   query?: string;
   url?: string;
@@ -209,6 +209,7 @@ const VERB_PINS: { verbs: string[]; intent: Intent["intent"] }[] = [
   { verbs: ["disk space", "storage", "wifi", "internet"], intent: "troubleshoot" },
   { verbs: ["empty trash", "empty the trash", "take out the trash"], intent: "empty_trash" },
   { verbs: ["trash", "delete", "remove"], intent: "file_trash" },
+  { verbs: ["history", "what have you done", "what did you do", "changelog"], intent: "history" },
 ];
 
 // sound/volume/brightness lead-words: with an action they're a settings
@@ -249,6 +250,7 @@ function verbPin(input: string): Intent | null {
       if (intent === "file_search") rest = rest.replace(/^(my|the)\s+/i, "");
       if (intent === "app_launch") return { intent, app: rest };
       if (intent === "troubleshoot") return { intent, query: v };
+      if (intent === "history") return { intent };
       if (intent === "file_trash") rest = rest.replace(/^(my|the|that|this)\s+/i, "");
       return { intent, query: rest };
     }
@@ -472,6 +474,8 @@ function App() {
             );
           }
         }
+      } else if (intent.intent === "history") {
+        setReply(await invoke<string>("get_history"));
       } else if (intent.intent === "empty_trash") {
         const n = await invoke<number>("trash_count");
         if (n === 0) {

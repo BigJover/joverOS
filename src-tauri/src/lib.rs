@@ -82,6 +82,7 @@ For web_open and web_search: if the user names a browser (e.g. chrome, safari, f
 - file_organize: the user wants to tidy/organize/sort a folder's files into subfolders (moving only, never deleting). Set \"query\" to the folder name (e.g. downloads, desktop).\n\
 - troubleshoot: the user reports a computer problem to diagnose — disk full, wifi/internet not working, computer running slow, sound/audio not working. Set \"query\" to the problem area: disk, wifi, slow, or audio.\n\
 - empty_trash: the user wants to empty the trash/bin for good.\n\
+- history: the user asks what the agent has done or changed recently.\n\
 - file_trash: the user wants to delete a specific file or folder, or move it to the trash. Set \"query\" to words identifying the file.\n\
 - settings: the user wants to change the sound volume or screen brightness (\"turn it down\", \"volume 30\", \"dim the screen\", \"mute\"). Set \"query\" to: volume or brightness, then a 0-100 number or up/down/max/mute/unmute.\n\
 - unknown: anything else — including changing other settings or installing software. Set \"reply\" to one short sentence stating you can't do that yet.\n\
@@ -120,7 +121,7 @@ async fn route_intent(input: String) -> Result<Intent, String> {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
-            "intent": { "type": "string", "enum": ["app_launch", "web_open", "web_search", "file_search", "file_organize", "troubleshoot", "settings", "empty_trash", "file_trash", "unknown"] },
+            "intent": { "type": "string", "enum": ["app_launch", "web_open", "web_search", "file_search", "file_organize", "troubleshoot", "settings", "empty_trash", "file_trash", "history", "unknown"] },
             "app": { "type": "string" },
             "query": { "type": "string" },
             "url": { "type": "string" },
@@ -468,6 +469,10 @@ fn apply_organize(app: AppHandle, moves: Vec<PlannedMove>) -> Result<String, Str
     if done == 0 {
         return Ok("Nothing to move.".into());
     }
+    let _ = conn.execute(
+        "INSERT INTO history (action, detail) VALUES ('organize', ?1)",
+        [format!("{done} files into {} folders", dirs.len())],
+    );
     Ok(format!(
         "Moved {done} files into {} folders. Type undo to reverse.",
         dirs.len()
@@ -524,6 +529,12 @@ fn undo_last(app: AppHandle) -> Result<String, String> {
     }
     conn.execute("DELETE FROM file_ops WHERE batch = ?1", [batch])
         .map_err(|e| e.to_string())?;
+    if back > 0 {
+        let _ = conn.execute(
+            "INSERT INTO history (action, detail) VALUES ('undo', ?1)",
+            [format!("{back} files put back")],
+        );
+    }
     // category folders the undo emptied get cleaned up; occupied ones stay
     for dir in dirs {
         let _ = std::fs::remove_dir(&dir);
@@ -817,14 +828,24 @@ fn level_from(action: &str, current: impl Fn() -> i32) -> Result<i32, String> {
 }
 
 #[tauri::command]
-fn set_volume(action: String) -> Result<String, String> {
+fn set_volume(app: AppHandle, action: String) -> Result<String, String> {
+    let log = |detail: &str| {
+        if let Ok(conn) = mem_db(&app) {
+            let _ = conn.execute(
+                "INSERT INTO history (action, detail) VALUES ('volume', ?1)",
+                [detail],
+            );
+        }
+    };
     match action.as_str() {
         "mute" => {
             osa("set volume output muted true");
+            log("muted");
             return Ok("Muted.".into());
         }
         "unmute" => {
             osa("set volume output muted false");
+            log("unmuted");
             return Ok("Unmuted.".into());
         }
         _ => {}
@@ -837,13 +858,14 @@ fn set_volume(action: String) -> Result<String, String> {
     if target > 0 {
         osa("set volume output muted false");
     }
+    log(&format!("{target}%"));
     Ok(format!("Volume {target}%."))
 }
 
 // No public API for brightness — this is the same private DisplayServices
 // call the settings daemon uses (verified on this hardware). Fails soft.
 #[tauri::command]
-fn set_brightness(action: String) -> Result<String, String> {
+fn set_brightness(app: AppHandle, action: String) -> Result<String, String> {
     unsafe {
         let cg = libc::dlopen(
             c"/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics".as_ptr(),
@@ -873,6 +895,12 @@ fn set_brightness(action: String) -> Result<String, String> {
         })?;
         if set(id, target as f32 / 100.0) != 0 {
             return Err("this display doesn't allow brightness control".into());
+        }
+        if let Ok(conn) = mem_db(&app) {
+            let _ = conn.execute(
+                "INSERT INTO history (action, detail) VALUES ('brightness', ?1)",
+                [format!("{target}%")],
+            );
         }
         Ok(format!("Brightness {target}%."))
     }
@@ -1133,6 +1161,42 @@ fn empty_trash(app: AppHandle) -> Result<String, String> {
     Ok(format!("Emptied the Trash — {total} item{} gone for good.", if total == 1 { "" } else { "s" }))
 }
 
+// The undo log's face: everything the agent ever changed, tersely.
+#[tauri::command]
+fn get_history(app: AppHandle) -> Result<String, String> {
+    let conn = mem_db(&app)?;
+    let mut stmt = conn
+        .prepare("SELECT strftime('%m-%d %H:%M', ts, 'localtime'), action, detail FROM history ORDER BY id DESC LIMIT 10")
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+    if rows.is_empty() {
+        return Ok("Nothing yet — I haven't changed anything on this Mac.".into());
+    }
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|(ts, action, detail)| {
+            let label = match action.as_str() {
+                "trash_file" => format!("Trashed {detail}"),
+                "restore" => format!("Put back {detail}"),
+                "restore_trash" => format!("Restored {detail}"),
+                "empty_trash" => format!("Emptied Trash ({detail})"),
+                "delete_file" => format!("Deleted {detail} forever"),
+                "organize" => format!("Organized {detail}"),
+                "undo" => format!("Undid — {detail}"),
+                "volume" => format!("Volume → {detail}"),
+                "brightness" => format!("Brightness → {detail}"),
+                _ => format!("{action} {detail}"),
+            };
+            format!("{ts}  {label}")
+        })
+        .collect();
+    Ok(lines.join("\n"))
+}
+
 // --- Agent memory (SQLite, per spec) — first table: learned web destinations.
 
 fn mem_db(app: &AppHandle) -> Result<rusqlite::Connection, String> {
@@ -1366,6 +1430,7 @@ pub fn run() {
             diagnose_audio,
             trash_file,
             delete_file,
+            get_history,
             restore_trash,
             restore_named,
             trash_count,

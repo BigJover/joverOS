@@ -878,36 +878,54 @@ fn set_brightness(action: String) -> Result<String, String> {
     }
 }
 
-// Trashing a file is the reversible delete: Finder does the move (its
-// own Put Back keeps working) and the op is journaled in file_ops with a
-// trash: marker so our "undo" can restore it to where it lived.
+// The bar keeps its OWN trash. macOS lets apps script files INTO the
+// system Trash but blocks getting them OUT without Full Disk Access —
+// and TCC grants pin to the code signature, which changes every dev
+// rebuild. Instead of fighting that, trashed files move to a holding
+// area the bar owns: restore is a plain rename, guaranteed, zero
+// permissions. "empty trash" purges this AND the system Trash.
+fn bar_trash_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("trash");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
 #[tauri::command]
 fn trash_file(app: AppHandle, path: String) -> Result<String, String> {
     let name = Path::new(&path)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .ok_or("bad path")?;
-    let out = osa(&format!(
-        "tell application \"Finder\" to delete POSIX file \"{}\"",
-        path.replace('"', "\\\"")
-    ));
-    if out.to_lowercase().contains("error") {
-        return Err(format!("Finder wouldn't trash it: {}", out.trim()));
+    let dir = bar_trash_dir(&app)?;
+    let mut hold = dir.join(&name);
+    if hold.exists() {
+        let stem = hold.file_stem().and_then(|x| x.to_str()).unwrap_or("file").to_string();
+        let ext = hold
+            .extension()
+            .and_then(|x| x.to_str())
+            .map(|e| format!(".{e}"))
+            .unwrap_or_default();
+        let mut n = 2;
+        while hold.exists() {
+            hold = dir.join(format!("{stem} {n}{ext}"));
+            n += 1;
+        }
     }
+    std::fs::rename(&path, &hold).map_err(|e| format!("couldn't move {name}: {e}"))?;
     let conn = mem_db(&app)?;
     let batch: i64 = conn
         .query_row("SELECT COALESCE(MAX(batch), 0) + 1 FROM file_ops", [], |r| r.get(0))
         .map_err(|e| e.to_string())?;
     conn.execute(
         "INSERT INTO file_ops (batch, src, dst) VALUES (?1, ?2, ?3)",
-        rusqlite::params![batch, path, format!("trash:{name}")],
+        rusqlite::params![batch, path, hold.to_string_lossy()],
     )
     .map_err(|e| e.to_string())?;
     let _ = conn.execute(
         "INSERT INTO history (action, detail) VALUES ('trash_file', ?1)",
         [&name],
     );
-    Ok(format!("Moved {name} to Trash — undo puts it back."))
+    Ok(format!("Trashed {name} — “put {name} back” or undo restores it; “empty trash” deletes it for good."))
 }
 
 // macOS protects the Trash: Finder will script items IN but refuses to
@@ -915,68 +933,84 @@ fn trash_file(app: AppHandle, path: String) -> Result<String, String> {
 // So restoring tries the direct route first (instant with FDA), then
 // Finder, and if both are blocked says exactly which switch to flip.
 // Ok(true) = home again (or already was); Ok(false) = blocked.
-fn restore_one(conn: &rusqlite::Connection, id: i64, src: &str, name: &str) -> bool {
-    if Path::new(src).exists() {
-        // already back (Finder Put Back, or a re-download) — row is stale
-        let _ = conn.execute("DELETE FROM file_ops WHERE id = ?1", [id]);
-        return true;
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let restored = std::fs::rename(format!("{home}/.Trash/{name}"), src).is_ok() || {
-        let out = osa(&format!(
-            "tell application \"Finder\" to move (first item of trash whose name is \"{}\") to (POSIX file \"{}\" as alias)",
-            name.replace('"', "\\\""),
-            Path::new(src).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default().replace('"', "\\\"")
-        ));
-        !out.to_lowercase().contains("error")
+fn restore_row(conn: &rusqlite::Connection, id: i64, src: &str, dst: &str) -> bool {
+    let restored = if let Some(name) = dst.strip_prefix("trash:") {
+        // legacy row: item went to the system Trash, which macOS guards
+        Path::new(src).exists() || {
+            let out = osa(&format!(
+                "tell application \"Finder\" to move (first item of trash whose name is \"{}\") to (POSIX file \"{}\" as alias)",
+                name.replace('"', "\\\""),
+                Path::new(src).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default().replace('"', "\\\"")
+            ));
+            !out.to_lowercase().contains("error")
+        }
+    } else if Path::new(src).exists() {
+        // stale iff the held copy is gone; a conflict keeps the row
+        !Path::new(dst).exists()
+    } else {
+        std::fs::rename(dst, src).is_ok()
     };
     if restored {
         let _ = conn.execute("DELETE FROM file_ops WHERE id = ?1", [id]);
         let _ = conn.execute(
             "INSERT INTO history (action, detail) VALUES ('restore', ?1)",
-            [name],
+            [Path::new(src).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()],
         );
     }
     restored
 }
 
-const FDA_HINT: &str = "macOS protects the Trash from apps. Either use Finder's File → Put Back (⌘⌫), or grant joverOS Full Disk Access once (System Settings → Privacy & Security → Full Disk Access) and I can restore directly from then on.";
+const SYS_TRASH_HINT: &str = "it's in the system Trash, which macOS guards — use Finder's File → Put Back (⌘⌫) there.";
 
 // Put one named thing back: "put eva back", "restore eva.jpg".
 #[tauri::command]
+fn trash_rows(conn: &rusqlite::Connection, dir: &Path) -> Result<Vec<(i64, String, String)>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, src, dst FROM file_ops WHERE dst LIKE 'trash:%' OR dst LIKE ?1 ORDER BY id DESC")
+        .map_err(|e| e.to_string())?;
+    let r = stmt
+        .query_map([format!("{}/%", dir.to_string_lossy())], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+    Ok(r)
+}
+
+#[tauri::command]
 fn restore_named(app: AppHandle, what: String) -> Result<String, String> {
     let conn = mem_db(&app)?;
-    let rows: Vec<(i64, String, String)> = {
-        let mut stmt = conn
-            .prepare("SELECT id, src, dst FROM file_ops WHERE dst LIKE 'trash:%' ORDER BY id DESC")
-            .map_err(|e| e.to_string())?;
-        let r = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
-        r
-    };
+    let rows = trash_rows(&conn, &bar_trash_dir(&app)?)?;
     let q = what.trim().to_lowercase();
     let stem = q.rsplit_once('.').map(|(b, _)| b.to_string()).unwrap_or_else(|| q.clone());
-    let hit = rows.iter().find(|(_, _, dst)| {
-        let name = dst.strip_prefix("trash:").unwrap_or(dst).to_lowercase();
+    let hit = rows.iter().find(|(_, src, _)| {
+        let name = Path::new(src)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
         name.contains(&q) || name.contains(&stem)
     });
     let Some((id, src, dst)) = hit else {
-        // maybe it's in the trash, just not ours
+        // maybe it's in the system trash, just not ours
         let names = osa("tell application \"Finder\" to get name of items in trash").to_lowercase();
         return Ok(if names.contains(&stem) {
-            format!("“{what}” is in the Trash, but it wasn't me who put it there — only Finder knows where it came from. {FDA_HINT}")
+            format!("“{what}” wasn't trashed by me — {SYS_TRASH_HINT}")
         } else {
-            format!("I don't have “{what}” in my trash journal, and nothing like it is in the Trash.")
+            format!("I don't have “{what}” in my trash, and nothing like it is in the system Trash.")
         });
     };
-    let name = dst.strip_prefix("trash:").unwrap_or(dst).to_string();
-    if restore_one(&conn, *id, src, &name) {
-        Ok(format!("Put {name} back — {}", src.replacen(&std::env::var("HOME").unwrap_or_default(), "~", 1)))
+    let name = Path::new(src)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if restore_row(&conn, *id, src, dst) {
+        Ok(format!(
+            "Put {name} back — {}",
+            src.replacen(&std::env::var("HOME").unwrap_or_default(), "~", 1)
+        ))
     } else {
-        Ok(format!("Couldn't pull {name} out of the Trash. {FDA_HINT}"))
+        Ok(format!("Couldn't restore {name} — {SYS_TRASH_HINT}"))
     }
 }
 
@@ -988,51 +1022,32 @@ fn restore_named(app: AppHandle, what: String) -> Result<String, String> {
 #[tauri::command]
 fn restore_trash(app: AppHandle) -> Result<String, String> {
     let conn = mem_db(&app)?;
-    let rows: Vec<(i64, String, String)> = {
-        let mut stmt = conn
-            .prepare("SELECT id, src, dst FROM file_ops WHERE dst LIKE 'trash:%' ORDER BY id DESC")
-            .map_err(|e| e.to_string())?;
-        let r = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
-        r
-    };
+    let rows = trash_rows(&conn, &bar_trash_dir(&app)?)?;
     let mut back = 0usize;
     let mut blocked = 0usize;
     for (id, src, dst) in &rows {
-        let Some(name) = dst.strip_prefix("trash:") else { continue };
-        if restore_one(&conn, *id, src, name) {
+        if restore_row(&conn, *id, src, dst) {
             back += 1;
         } else {
             blocked += 1;
         }
     }
-    let remaining = trash_count().unwrap_or(0);
-    Ok(if blocked > 0 {
-        format!(
-            "Restored {back}, but {blocked} of mine {} stuck in the Trash. {FDA_HINT}",
-            if blocked == 1 { "is" } else { "are" }
-        )
-    } else {
-        match (back, remaining) {
-            (0, 0) => "Trash is empty — nothing to restore.".into(),
-            (0, n) => format!(
-                "The {n} item{} in the Trash {} put there in Finder, not by me — only Finder knows where {} came from. Use Finder's File → Put Back (⌘⌫), or grant joverOS Full Disk Access and I can do it.",
-                if n == 1 { "" } else { "s" },
-                if n == 1 { "was" } else { "were" },
-                if n == 1 { "it" } else { "they" }
-            ),
-            (b, 0) => format!("Put {b} file{} back where {} lived.", if b == 1 { "" } else { "s" }, if b == 1 { "it" } else { "they" }),
-            (b, n) => format!(
-                "Put {b} file{} back. {n} more {} trashed in Finder — File → Put Back (⌘⌫) there restores {}.",
-                if b == 1 { "" } else { "s" },
-                if n == 1 { "was" } else { "were" },
-                if n == 1 { "it" } else { "them" }
-            ),
-        }
-    })
+    let sys = sys_trash_count().unwrap_or(0);
+    let mut out = match back {
+        0 => "Nothing of mine to restore.".to_string(),
+        b => format!("Put {b} file{} back where {} lived.", if b == 1 { "" } else { "s" }, if b == 1 { "it" } else { "they" }),
+    };
+    if blocked > 0 {
+        out.push_str(&format!(" {blocked} couldn't be restored — {SYS_TRASH_HINT}"));
+    } else if sys > 0 {
+        out.push_str(&format!(
+            " ({sys} item{} in the system Trash {} put there in Finder — File → Put Back ⌘⌫ restores {}.)",
+            if sys == 1 { "" } else { "s" },
+            if sys == 1 { "was" } else { "were" },
+            if sys == 1 { "it" } else { "them" }
+        ));
+    }
+    Ok(out)
 }
 
 // --- Empty trash (M3): the first destructive action, so it sets the
@@ -1041,8 +1056,7 @@ fn restore_trash(app: AppHandle) -> Result<String, String> {
 // Deleting is exactly what the undo log can NOT reverse, and the
 // confirm text says so.
 
-#[tauri::command]
-fn trash_count() -> Result<i64, String> {
+fn sys_trash_count() -> Result<i64, String> {
     let out = osa("tell application \"Finder\" to count items in trash");
     out.trim()
         .parse()
@@ -1050,22 +1064,48 @@ fn trash_count() -> Result<i64, String> {
 }
 
 #[tauri::command]
+fn trash_count(app: AppHandle) -> Result<i64, String> {
+    let ours = std::fs::read_dir(bar_trash_dir(&app)?)
+        .map(|d| d.flatten().count() as i64)
+        .unwrap_or(0);
+    Ok(ours + sys_trash_count().unwrap_or(0))
+}
+
+#[tauri::command]
 fn empty_trash(app: AppHandle) -> Result<String, String> {
-    let n = trash_count()?;
-    if n == 0 {
+    let dir = bar_trash_dir(&app)?;
+    let held: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .map(|d| d.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    let sys = sys_trash_count().unwrap_or(0);
+    if held.is_empty() && sys == 0 {
         return Ok("Trash is already empty.".into());
     }
-    let out = osa("tell application \"Finder\" to empty trash");
-    if out.to_lowercase().contains("error") {
-        return Err(format!("Finder wouldn't empty the trash: {}", out.trim()));
+    for p in &held {
+        let _ = if p.is_dir() {
+            std::fs::remove_dir_all(p)
+        } else {
+            std::fs::remove_file(p)
+        };
     }
+    if sys > 0 {
+        let out = osa("tell application \"Finder\" to empty trash");
+        if out.to_lowercase().contains("error") {
+            return Err(format!("Emptied mine ({}), but Finder wouldn't empty the system Trash: {}", held.len(), out.trim()));
+        }
+    }
+    let total = held.len() as i64 + sys;
     if let Ok(conn) = mem_db(&app) {
         let _ = conn.execute(
+            "DELETE FROM file_ops WHERE dst LIKE ?1",
+            [format!("{}/%", dir.to_string_lossy())],
+        );
+        let _ = conn.execute(
             "INSERT INTO history (action, detail) VALUES ('empty_trash', ?1)",
-            [format!("{n} items")],
+            [format!("{total} items")],
         );
     }
-    Ok(format!("Emptied the Trash — {n} items gone for good."))
+    Ok(format!("Emptied the Trash — {total} item{} gone for good.", if total == 1 { "" } else { "s" }))
 }
 
 // --- Agent memory (SQLite, per spec) — first table: learned web destinations.

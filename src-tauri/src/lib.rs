@@ -1050,6 +1050,31 @@ fn restore_trash(app: AppHandle) -> Result<String, String> {
     Ok(out)
 }
 
+// Hard delete — no holding bay, no undo. Reachable ONLY through
+// explicit phrasing ("permanently delete", "delete X forever"): the
+// router model is never allowed to pick this intent, so an ambiguous
+// "delete X" always lands in the reversible path.
+#[tauri::command]
+fn delete_file(app: AppHandle, path: String) -> Result<String, String> {
+    let name = Path::new(&path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .ok_or("bad path")?;
+    let p = Path::new(&path);
+    if p.is_dir() {
+        std::fs::remove_dir_all(p).map_err(|e| e.to_string())?;
+    } else {
+        std::fs::remove_file(p).map_err(|e| e.to_string())?;
+    }
+    if let Ok(conn) = mem_db(&app) {
+        let _ = conn.execute(
+            "INSERT INTO history (action, detail) VALUES ('delete_file', ?1)",
+            [&name],
+        );
+    }
+    Ok(format!("Deleted {name} — gone for good."))
+}
+
 // --- Empty trash (M3): the first destructive action, so it sets the
 // pattern — count first, confirm in the bar, go through Finder (macOS
 // asks its own one-time consent for that), record it in history.
@@ -1340,6 +1365,7 @@ pub fn run() {
             diagnose_slow,
             diagnose_audio,
             trash_file,
+            delete_file,
             restore_trash,
             restore_named,
             trash_count,

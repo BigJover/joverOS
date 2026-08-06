@@ -109,7 +109,7 @@ type OrganizePlan = { summary: string; moves: PlannedMove[] };
 type Pending = { exec: () => Promise<string> };
 
 type Intent = {
-  intent: "app_launch" | "web_open" | "web_search" | "file_search" | "file_organize" | "troubleshoot" | "settings" | "empty_trash" | "file_trash" | "unknown";
+  intent: "app_launch" | "web_open" | "web_search" | "file_search" | "file_organize" | "troubleshoot" | "settings" | "empty_trash" | "file_trash" | "file_delete" | "unknown";
   app?: string;
   query?: string;
   url?: string;
@@ -222,8 +222,13 @@ const SETTING_TARGETS: Record<string, string> = {
 // model needed, and the model sometimes reads "move" as folder-organize.
 const TRASH_PHRASE = /^(?:move|put|send|throw|chuck|drag)\s+(.+?)\s+(?:into|to|in)\s+(?:the\s+)?(?:trash|bin)$/i;
 const THROW_AWAY = /^(?:throw away|throw out|get rid of|dispose of)\s+(.+)$/i;
+// hard delete fires ONLY on these exact shapes — never from the model
+const PERM_DELETE =
+  /^(?:permanently |hard )delete\s+(.+)$|^delete\s+(.+?)\s+(?:forever|permanently|for good)$|^shred\s+(.+)$/i;
 
 function verbPin(input: string): Intent | null {
+  const perm = input.match(PERM_DELETE);
+  if (perm) return { intent: "file_delete", query: perm[1] ?? perm[2] ?? perm[3] };
   const phrase = input.match(TRASH_PHRASE) ?? input.match(THROW_AWAY);
   if (phrase) return { intent: "file_trash", query: phrase[1] };
   const lower = input.toLowerCase();
@@ -428,7 +433,8 @@ function App() {
           : ["diagnose_disk", "disk"];
         setStatus(`checking ${what}…`);
         setReply(await invoke<string>(cmd));
-      } else if (intent.intent === "file_trash") {
+      } else if (intent.intent === "file_delete" || intent.intent === "file_trash") {
+        const permanent = intent.intent === "file_delete";
         // whatever routed us here, scrub trash-talk and fillers so only
         // the file description reaches the search
         const what = (intent.query ?? "")
@@ -455,9 +461,14 @@ function App() {
               hits.length > 1
                 ? ` (${hits.length - 1} other match${hits.length === 2 ? "" : "es"} — be more specific if this isn't it)`
                 : "";
-            setPending({ exec: () => invoke<string>("trash_file", { path: top.path }) });
+            setPending({
+              exec: () =>
+                invoke<string>(permanent ? "delete_file" : "trash_file", { path: top.path }),
+            });
             setReply(
-              `Move “${top.name}” to Trash?\n${top.path.replace(/^\/Users\/[^/]+/, "~")}\nEnter to confirm — undo puts it back. Esc to cancel.${more}`
+              permanent
+                ? `DELETE “${top.name}” FOR GOOD?\n${top.path.replace(/^\/Users\/[^/]+/, "~")}\nThis can NOT be undone. Enter to delete forever, Esc to cancel.${more}`
+                : `Move “${top.name}” to Trash?\n${top.path.replace(/^\/Users\/[^/]+/, "~")}\nEnter to confirm — undo puts it back. Esc to cancel.${more}`
             );
           }
         }

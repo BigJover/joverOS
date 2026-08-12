@@ -209,7 +209,15 @@ const VERB_PINS: { verbs: string[]; intent: Intent["intent"] }[] = [
   { verbs: ["disk space", "storage", "wifi", "internet"], intent: "troubleshoot" },
   { verbs: ["empty trash", "empty the trash", "take out the trash"], intent: "empty_trash" },
   { verbs: ["trash", "delete", "remove"], intent: "file_trash" },
-  { verbs: ["history", "what have you done", "what did you do", "changelog"], intent: "history" },
+  {
+    verbs: [
+      "history", "what have you done", "what did you do", "what have you changed",
+      "what did you change", "what happened", "changelog", "past actions",
+      "recent actions", "actions", "action log", "activity log", "activity",
+      "recent changes", "changes", "audit", "audit log", "paper trail", "log",
+    ],
+    intent: "history",
+  },
 ];
 
 // sound/volume/brightness lead-words: with an action they're a settings

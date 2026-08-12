@@ -231,11 +231,20 @@ const SETTING_TARGETS: Record<string, string> = {
 // model needed, and the model sometimes reads "move" as folder-organize.
 const TRASH_PHRASE = /^(?:move|put|send|throw|chuck|drag)\s+(.+?)\s+(?:into|to|in)\s+(?:the\s+)?(?:trash|bin)$/i;
 const THROW_AWAY = /^(?:throw away|throw out|get rid of|dispose of)\s+(.+)$/i;
+// "X won't open" in its usual shapes — pins to the file diagnosis
+const WONT_OPEN =
+  /^(?:why )?(?:won'?t|wont|can'?t|cannot)\s+(.+?)\s+open$|^(.+?)\s+(?:won'?t|wont|isn'?t|is not|doesn'?t|does not)\s+open(?:ing)?$|^(?:why )?can'?t (?:i )?open\s+(.+)$/i;
+
 // hard delete fires ONLY on these exact shapes — never from the model
 const PERM_DELETE =
   /^(?:permanently |hard )delete\s+(.+)$|^delete\s+(.+?)\s+(?:forever|permanently|for good)$|^shred\s+(.+)$/i;
 
 function verbPin(input: string): Intent | null {
+  const wo = input.match(WONT_OPEN);
+  if (wo) {
+    const name = (wo[1] ?? wo[2] ?? wo[3]).replace(/^(?:my|the|this|that)\s+/i, "");
+    return { intent: "troubleshoot", query: `file ${name}` };
+  }
   const perm = input.match(PERM_DELETE);
   if (perm) return { intent: "file_delete", query: perm[1] ?? perm[2] ?? perm[3] };
   const phrase = input.match(TRASH_PHRASE) ?? input.match(THROW_AWAY);
@@ -434,6 +443,25 @@ function App() {
         }
       } else if (intent.intent === "troubleshoot") {
         const area = (intent.query ?? input).toLowerCase();
+        const fileName = area.match(/^file\s+(.+)$/)?.[1];
+        if (fileName) {
+          const { terms, kind, since, until } = parseSearch(fileName);
+          setStatus(`finding ${terms || fileName}…`);
+          const hits = await invoke<FileHit[]>("search_files", {
+            query: terms || fileName,
+            kind,
+            since,
+            until,
+            order: null,
+          });
+          if (hits.length === 0) {
+            setReply(`Couldn't find “${fileName}” to check.`);
+          } else {
+            setStatus(`checking ${hits[0].name}…`);
+            setReply(await invoke<string>("diagnose_file", { path: hits[0].path }));
+          }
+          return;
+        }
         const [cmd, what] = /wi-?fi|internet|network|online|connect/.test(area)
           ? ["diagnose_wifi", "network"]
           : /slow|sluggish|lag|freez|frozen/.test(area)

@@ -40,7 +40,7 @@ Certain first words pin what happens, deterministically — no model, no guessin
 | `trash <file>` / `delete <file>` | move a file **to the Trash** — shows which file first, Enter confirms, `undo` puts it back |
 | `empty trash` | count what's there, then **empty it** — only after you press Enter |
 | `permanently delete <file>` / `delete <file> forever` | **hard delete**, no trash stop — stark confirm; plain `delete` always stays reversible |
-| `disk space` / `wifi` / `sound` / "why is my mac slow" | **diagnose** the problem, layer by layer |
+| `disk space` / `wifi` / `sound` / "why is my mac slow" / "report.pdf won't open" | **diagnose** the problem, layer by layer |
 | `sound 15` / `volume up` / `mute` / `brightness 70` | **set** volume or brightness — loose: `sound 15`, `sound volume 15%`, "dim the screen" all work |
 
 Everything else is free-form — the local model figures out what you meant.

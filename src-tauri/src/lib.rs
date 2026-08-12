@@ -80,7 +80,7 @@ const ROUTER_PROMPT: &str = "You route commands for a desktop agent bar. Classif
 For web_open and web_search: if the user names a browser (e.g. chrome, safari, firefox), also set \"app\" to that browser's name.\n\
 - file_search: the user wants to FIND files, documents, or folders on this computer (finding only, no changes). Set \"query\" to only the words likely in the file's name or contents — drop filler like \"find\", \"my\", \"that\", \"file\".\n\
 - file_organize: the user wants to tidy/organize/sort a folder's files into subfolders (moving only, never deleting). Set \"query\" to the folder name (e.g. downloads, desktop).\n\
-- troubleshoot: the user reports a computer problem to diagnose — disk full, wifi/internet not working, computer running slow, sound/audio not working. Set \"query\" to the problem area: disk, wifi, slow, or audio.\n\
+- troubleshoot: the user reports a computer problem to diagnose — disk full, wifi/internet not working, computer running slow, sound/audio not working, or a specific file that won't open. Set \"query\" to the problem area: disk, wifi, slow, audio — or for a file, the word file plus the file's name (\"file report.pdf\").\n\
 - empty_trash: the user wants to empty the trash/bin for good.\n\
 - history: the user asks what the agent has done or changed recently.\n\
 - file_trash: the user wants to delete a specific file or folder, or move it to the trash. Set \"query\" to words identifying the file.\n\
@@ -761,6 +761,52 @@ fn diagnose_slow() -> Result<String, String> {
     Ok(out)
 }
 
+// Why won't this file open? Walk the reasons in order of likelihood and
+// name the first one that applies — each with the fix in plain language.
+#[tauri::command]
+fn diagnose_file(path: String) -> Result<String, String> {
+    let p = Path::new(&path);
+    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
+    let home = std::env::var("HOME").unwrap_or_default();
+    let short = path.replacen(&home, "~", 1);
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+
+    let md = match std::fs::metadata(p) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Ok(format!(
+                "{short}\n→ macOS won't even let me look at it — the folder it's in is off-limits to this account. If it's on an external drive or another user's folder, that's why."
+            ))
+        }
+        Err(e) => return Ok(format!("{short}\n→ Can't read it at all: {e}.")),
+    };
+
+    let verdict = if name.ends_with(".icloud") || (ext == "icloud") {
+        "This is an iCloud placeholder — the real file isn't on this Mac yet. Open the folder in Finder and click the cloud icon to download it, then it'll open.".to_string()
+    } else if ["crdownload", "download", "part", "partial"].contains(&ext.as_str()) {
+        "This is an unfinished download, not the real file. Go back to the browser and let the download complete (or restart it).".to_string()
+    } else if md.is_file() && md.len() == 0 {
+        "The file is completely empty (0 bytes) — the download or save that created it never finished. Re-download or re-export it; there's nothing inside to open.".to_string()
+    } else if std::fs::File::open(p).err().is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) {
+        "macOS says this account doesn't have permission to read it. Right-click → Get Info, and check Sharing & Permissions at the bottom — you need at least Read.".to_string()
+    } else if sh("ls", &["-ldO", &path]).contains("uchg") {
+        "The file is locked. Right-click → Get Info and untick Locked, then it'll open normally.".to_string()
+    } else if ext == "app" && !sh("xattr", &["-p", "com.apple.quarantine", &path]).trim().is_empty() {
+        "This app is quarantined by Gatekeeper (it was downloaded from the internet). Right-click it → Open, then confirm — that only needs doing once.".to_string()
+    } else {
+        let kind = sh("mdls", &["-name", "kMDItemKind", "-raw", &path]);
+        let kind = kind.trim();
+        if kind.is_empty() || kind == "(null)" || kind.eq_ignore_ascii_case("data") {
+            format!("No app on this Mac claims this file type ({}). Whoever sent it can say what app made it — or try right-click → Open With to test a likely one.",
+                if ext.is_empty() { "no extension".to_string() } else { format!(".{ext}") })
+        } else {
+            let mb = md.len() as f64 / 1e6;
+            format!("The file itself looks healthy — readable, {mb:.1} MB, recognized as {kind}. The problem is likely the app that opens it: quit and reopen that app, or try right-click → Open With to use a different one.")
+        }
+    };
+    Ok(format!("{short}\n→ {verdict}"))
+}
+
 #[tauri::command]
 fn diagnose_audio() -> Result<String, String> {
     let vol = sh("osascript", &["-e", "get volume settings"]);
@@ -1428,6 +1474,7 @@ pub fn run() {
             diagnose_wifi,
             diagnose_slow,
             diagnose_audio,
+            diagnose_file,
             trash_file,
             delete_file,
             get_history,

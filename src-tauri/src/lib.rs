@@ -1292,6 +1292,128 @@ fn list_grants(app: AppHandle) -> Result<String, String> {
     Ok(out)
 }
 
+// --- Workflows (M4): record the current session, replay it by name.
+// Recording = the apps open right now (System Events; one-time macOS
+// consent). Replaying = launch them all and let each app's own session
+// restore do the deep state — files, tabs, layout are the app's job,
+// and most modern apps do it well.
+
+fn running_apps() -> Vec<String> {
+    let out = osa(
+        "tell application \"System Events\" to get name of (processes where background only is false)",
+    );
+    if out.to_lowercase().contains("error") {
+        return Vec::new();
+    }
+    out.trim()
+        .split(", ")
+        .map(str::trim)
+        .filter(|a| {
+            !a.is_empty() && !["Finder", "joverOS", "joveros", "ai-os"].contains(a)
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+#[tauri::command]
+fn workflow_exists(app: AppHandle, name: String) -> bool {
+    mem_db(&app)
+        .ok()
+        .and_then(|c| {
+            c.query_row("SELECT 1 FROM workflows WHERE name = ?1", [name.trim().to_lowercase()], |_| Ok(true))
+                .ok()
+        })
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn save_workflow(app: AppHandle, name: String) -> Result<String, String> {
+    let apps = running_apps();
+    if apps.is_empty() {
+        return Err("Couldn't see your open apps — macOS may have declined the System Events consent. Check System Settings → Privacy & Security → Automation.".into());
+    }
+    let key = name.trim().to_lowercase();
+    let conn = mem_db(&app)?;
+    conn.execute(
+        "INSERT INTO workflows (name, apps) VALUES (?1, ?2)
+         ON CONFLICT(name) DO UPDATE SET apps = ?2, created = datetime('now')",
+        rusqlite::params![key, serde_json::to_string(&apps).unwrap_or_default()],
+    )
+    .map_err(|e| e.to_string())?;
+    let _ = conn.execute(
+        "INSERT INTO history (action, detail) VALUES ('workflow_save', ?1)",
+        [format!("{key}: {}", apps.join(", "))],
+    );
+    Ok(format!("Saved workflow {key}: {}. Type “workflow {key}” to bring it all back.", apps.join(", ")))
+}
+
+#[tauri::command]
+fn run_workflow(app: AppHandle, name: String) -> Result<String, String> {
+    let key = name.trim().to_lowercase();
+    let conn = mem_db(&app)?;
+    let apps_json: String = conn
+        .query_row("SELECT apps FROM workflows WHERE name = ?1", [&key], |r| r.get(0))
+        .or_else(|_| {
+            conn.query_row(
+                "SELECT apps FROM workflows WHERE name LIKE ?1 ORDER BY created DESC",
+                [format!("%{key}%")],
+                |r| r.get(0),
+            )
+        })
+        .map_err(|_| format!("No workflow called “{key}”. “workflows” lists what's saved."))?;
+    let apps: Vec<String> = serde_json::from_str(&apps_json).unwrap_or_default();
+    for a in &apps {
+        let _ = Command::new("open").args(["-a", a]).spawn();
+    }
+    let _ = conn.execute(
+        "INSERT INTO history (action, detail) VALUES ('workflow_run', ?1)",
+        [&key],
+    );
+    hide_bar(app);
+    Ok(format!("Workflow {key}: opening {}.", apps.join(", ")))
+}
+
+#[tauri::command]
+fn list_workflows(app: AppHandle) -> Result<String, String> {
+    let conn = mem_db(&app)?;
+    let mut stmt = conn
+        .prepare("SELECT name, apps FROM workflows ORDER BY name")
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+    if rows.is_empty() {
+        return Ok("No workflows yet. Open your apps the way you like, then “save as workflow 1”.".into());
+    }
+    Ok(rows
+        .iter()
+        .map(|(n, a)| {
+            let apps: Vec<String> = serde_json::from_str(a).unwrap_or_default();
+            format!("{n} — {}", apps.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+#[tauri::command]
+fn delete_workflow(app: AppHandle, name: String) -> Result<String, String> {
+    let key = name.trim().to_lowercase();
+    let conn = mem_db(&app)?;
+    let n = conn
+        .execute("DELETE FROM workflows WHERE name = ?1", [&key])
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Ok(format!("No workflow called “{key}”."));
+    }
+    let _ = conn.execute(
+        "INSERT INTO history (action, detail) VALUES ('workflow_delete', ?1)",
+        [&key],
+    );
+    Ok(format!("Forgot workflow {key}."))
+}
+
 // The undo log's face: everything the agent ever changed, tersely.
 #[tauri::command]
 fn get_history(app: AppHandle) -> Result<String, String> {
@@ -1334,6 +1456,15 @@ fn mem_db(app: &AppHandle) -> Result<rusqlite::Connection, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let conn = rusqlite::Connection::open(dir.join("memory.db")).map_err(|e| e.to_string())?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS workflows (
+            name TEXT PRIMARY KEY,
+            apps TEXT NOT NULL,
+            created TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS grants (
             scope TEXT PRIMARY KEY,
@@ -1574,6 +1705,11 @@ pub fn run() {
             set_grant,
             check_grant,
             list_grants,
+            workflow_exists,
+            save_workflow,
+            run_workflow,
+            list_workflows,
+            delete_workflow,
             restore_trash,
             restore_named,
             trash_count,

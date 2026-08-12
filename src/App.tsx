@@ -353,6 +353,35 @@ function App() {
         setReply(await invoke<string>("list_grants"));
         return;
       }
+      // Workflows: precise names, deterministic grammar only.
+      const t = input.trim();
+      const wfSave = t.match(/^(?:save|record)\b.*?\bas workflow\s+(.+)$/i) ?? t.match(/^(?:save|record) workflow\s+(.+)$/i);
+      const wfDel = t.match(/^(?:delete|remove|forget) workflow\s+(.+)$/i);
+      const wfRun = t.match(/^(?:run |open |load |start )?workflow\s+(.+)$/i);
+      if (/^(?:list |show |my )?workflows$/i.test(t)) {
+        setReply(await invoke<string>("list_workflows"));
+        return;
+      }
+      if (wfSave) {
+        const name = wfSave[1];
+        if (await invoke<boolean>("workflow_exists", { name })) {
+          setPending({ exec: () => invoke<string>("save_workflow", { name }) });
+          setReply(`Workflow ${name} already exists — Enter to overwrite it with the current setup, Esc to keep it.`);
+        } else {
+          setReply(await invoke<string>("save_workflow", { name }));
+        }
+        return;
+      }
+      if (wfDel) {
+        const name = wfDel[1];
+        setPending({ exec: () => invoke<string>("delete_workflow", { name }) });
+        setReply(`Forget workflow ${name}? Enter to confirm, Esc to cancel.`);
+        return;
+      }
+      if (wfRun) {
+        setReply(await invoke<string>("run_workflow", { name: wfRun[1] }));
+        return;
+      }
       // restore trash ≠ undo: brings back everything the bar ever trashed
       if (/^restore (the )?trash$/i.test(input.trim())) {
         setReply(await invoke<string>("restore_trash"));

@@ -1066,6 +1066,17 @@ fn restore_named(app: AppHandle, what: String) -> Result<String, String> {
         name.contains(&q) || name.contains(&stem)
     });
     let Some((id, src, dst)) = hit else {
+        // most common reason there's nothing to restore: it's already home
+        let home = std::env::var("HOME").unwrap_or_default();
+        if let Some(found) = mdfind(&["-onlyin", &home, "-name", &stem])
+            .into_iter()
+            .find(|p| !noise(p))
+        {
+            return Ok(format!(
+                "Nothing to restore — “{what}” is already where it belongs: {}",
+                found.replacen(&home, "~", 1)
+            ));
+        }
         // maybe it's in the system trash, just not ours
         let names = osa("tell application \"Finder\" to get name of items in trash").to_lowercase();
         return Ok(if names.contains(&stem) {

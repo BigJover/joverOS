@@ -362,6 +362,11 @@ function App() {
         setReply(await invoke<string>("list_workflows"));
         return;
       }
+      // Bare "save workflow" with no name — prompt instead of falling to LLM.
+      if (/^(?:save|record)\s+(?:as\s+)?workflow$/i.test(t)) {
+        setReply(`What would you like to name it? Try: save workflow 1`);
+        return;
+      }
       if (wfSave) {
         const name = wfSave[1];
         if (await invoke<boolean>("workflow_exists", { name })) {

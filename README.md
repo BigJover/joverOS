@@ -37,6 +37,7 @@ Certain first words pin what happens, deterministically — no model, no guessin
 | `undo` | **reverse** the last file operation |
 | `put eva.jpg back` / `restore eva` / `restore trash` | **restore** trashed files — one by name, or everything the bar trashed |
 | `history` / "what have you done" | the agent's **paper trail** — every change it ever made, newest first |
+| `always allow trash` / `always ask before organize` / `permissions` | **scoped grants** — skip confirms for reversible actions you trust; emptying and permanent deletion always ask |
 | `trash <file>` / `delete <file>` | move a file **to the Trash** — shows which file first, Enter confirms, `undo` puts it back |
 | `empty trash` | count what's there, then **empty it** — only after you press Enter |
 | `permanently delete <file>` / `delete <file> forever` | **hard delete**, no trash stop — stark confirm; plain `delete` always stays reversible |

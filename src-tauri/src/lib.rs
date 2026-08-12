@@ -1207,6 +1207,80 @@ fn empty_trash(app: AppHandle) -> Result<String, String> {
     Ok(format!("Emptied the Trash — {total} item{} gone for good.", if total == 1 { "" } else { "s" }))
 }
 
+// --- Scoped permissions (M3). Only REVERSIBLE actions can be granted:
+// trash (holding bay, restorable) and organize (undo log). Emptying and
+// permanent deletion always ask — no grant exists that lets the agent
+// silently do something it can't take back. Grants are changed only by
+// exact phrases in the frontend; the model has no path to this code.
+
+const GRANTABLE: &[&str] = &["trash", "organize"];
+
+#[tauri::command]
+fn set_grant(app: AppHandle, scope: String, allow: bool) -> Result<String, String> {
+    if !GRANTABLE.contains(&scope.as_str()) {
+        return Ok(match scope.as_str() {
+            "empty_trash" => "Emptying the Trash is forever, so I'll always ask — that one isn't grantable.".into(),
+            "delete" => "Permanent deletion always asks. Always.".into(),
+            _ => format!("Nothing called “{scope}” to grant. Grantable: trash, organize."),
+        });
+    }
+    let conn = mem_db(&app)?;
+    if allow {
+        conn.execute("INSERT OR IGNORE INTO grants (scope) VALUES (?1)", [&scope])
+            .map_err(|e| e.to_string())?;
+        let _ = conn.execute(
+            "INSERT INTO history (action, detail) VALUES ('grant', ?1)",
+            [&scope],
+        );
+        Ok(format!("Okay — I'll {scope} without asking from now on. “always ask before {scope}” reverts this."))
+    } else {
+        conn.execute("DELETE FROM grants WHERE scope = ?1", [&scope])
+            .map_err(|e| e.to_string())?;
+        let _ = conn.execute(
+            "INSERT INTO history (action, detail) VALUES ('revoke', ?1)",
+            [&scope],
+        );
+        Ok(format!("Back to asking before every {scope}."))
+    }
+}
+
+#[tauri::command]
+fn check_grant(app: AppHandle, scope: String) -> bool {
+    mem_db(&app)
+        .ok()
+        .and_then(|c| {
+            c.query_row("SELECT 1 FROM grants WHERE scope = ?1", [&scope], |_| Ok(true))
+                .ok()
+        })
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn list_grants(app: AppHandle) -> Result<String, String> {
+    let conn = mem_db(&app)?;
+    let mut stmt = conn
+        .prepare("SELECT scope FROM grants ORDER BY scope")
+        .map_err(|e| e.to_string())?;
+    let granted: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+    let mut out = String::new();
+    if granted.is_empty() {
+        out.push_str("I ask before every change (the default).\n");
+    } else {
+        out.push_str(&format!("Without asking: {}.\n", granted.join(", ")));
+    }
+    let ask: Vec<&str> = GRANTABLE.iter().filter(|s| !granted.contains(&s.to_string())).copied().collect();
+    if !ask.is_empty() {
+        out.push_str(&format!("Ask first: {}.\n", ask.join(", ")));
+    }
+    out.push_str("Always ask, not grantable: empty trash, permanent delete.\n");
+    out.push_str("“always allow trash” grants · “always ask before trash” reverts.");
+    Ok(out)
+}
+
 // The undo log's face: everything the agent ever changed, tersely.
 #[tauri::command]
 fn get_history(app: AppHandle) -> Result<String, String> {
@@ -1249,6 +1323,14 @@ fn mem_db(app: &AppHandle) -> Result<rusqlite::Connection, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let conn = rusqlite::Connection::open(dir.join("memory.db")).map_err(|e| e.to_string())?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS grants (
+            scope TEXT PRIMARY KEY,
+            granted_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1478,6 +1560,9 @@ pub fn run() {
             trash_file,
             delete_file,
             get_history,
+            set_grant,
+            check_grant,
+            list_grants,
             restore_trash,
             restore_named,
             trash_count,

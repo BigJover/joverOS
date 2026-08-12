@@ -334,6 +334,25 @@ function App() {
         setReply(await invoke<string>("undo_last"));
         return;
       }
+      // Scoped permissions: exact phrases only — the model has no route
+      // to granting itself anything.
+      const scopeOf = (t: string) =>
+        /empty/.test(t) ? "empty_trash"
+        : /organiz/.test(t) ? "organize"
+        : /permanent|forever|shred/.test(t) ? "delete"
+        : /trash|delete|remove/.test(t) ? "trash"
+        : t.trim();
+      const grantM = input.trim().match(/^(?:always allow|stop asking (?:before|about|for|when i)?\s*)(.+)$/i);
+      const askM = input.trim().match(/^(?:always ask(?:\s+(?:before|about|for))?|revoke)\s+(.+)$/i);
+      if (grantM || askM) {
+        const raw = (grantM?.[1] ?? askM?.[1] ?? "").toLowerCase();
+        setReply(await invoke<string>("set_grant", { scope: scopeOf(raw), allow: !!grantM }));
+        return;
+      }
+      if (/^(permissions|grants|what can you do without asking)$/i.test(input.trim())) {
+        setReply(await invoke<string>("list_grants"));
+        return;
+      }
       // restore trash ≠ undo: brings back everything the bar ever trashed
       if (/^restore (the )?trash$/i.test(input.trim())) {
         setReply(await invoke<string>("restore_trash"));
@@ -499,15 +518,19 @@ function App() {
               hits.length > 1
                 ? ` (${hits.length - 1} other match${hits.length === 2 ? "" : "es"} — be more specific if this isn't it)`
                 : "";
-            setPending({
-              exec: () =>
-                invoke<string>(permanent ? "delete_file" : "trash_file", { path: top.path }),
-            });
-            setReply(
-              permanent
-                ? `DELETE “${top.name}” FOR GOOD?\n${top.path.replace(/^\/Users\/[^/]+/, "~")}\nThis can NOT be undone. Enter to delete forever, Esc to cancel.${more}`
-                : `Move “${top.name}” to Trash?\n${top.path.replace(/^\/Users\/[^/]+/, "~")}\nEnter to confirm — undo puts it back. Esc to cancel.${more}`
-            );
+            const exec = () =>
+              invoke<string>(permanent ? "delete_file" : "trash_file", { path: top.path });
+            // trash is grantable (reversible); permanent delete never is
+            if (!permanent && (await invoke<boolean>("check_grant", { scope: "trash" }))) {
+              setReply((await exec()) + " (auto — “always ask before trash” reverts)");
+            } else {
+              setPending({ exec });
+              setReply(
+                permanent
+                  ? `DELETE “${top.name}” FOR GOOD?\n${top.path.replace(/^\/Users\/[^/]+/, "~")}\nThis can NOT be undone. Enter to delete forever, Esc to cancel.${more}`
+                  : `Move “${top.name}” to Trash?\n${top.path.replace(/^\/Users\/[^/]+/, "~")}\nEnter to confirm — undo puts it back. Esc to cancel.${more}`
+              );
+            }
           }
         }
       } else if (intent.intent === "history") {
@@ -537,6 +560,11 @@ function App() {
         });
         if (p.moves.length === 0) {
           setReply("Nothing loose to organize there.");
+        } else if (await invoke<boolean>("check_grant", { scope: "organize" })) {
+          setReply(
+            (await invoke<string>("apply_organize", { moves: p.moves })) +
+              " (auto — “always ask before organize” reverts)"
+          );
         } else {
           setPending({ exec: () => invoke<string>("apply_organize", { moves: p.moves }) });
           setReply(`${p.summary} — Enter to do it, Esc to cancel.`);

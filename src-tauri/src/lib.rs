@@ -1432,8 +1432,12 @@ fn run_workflow(app: AppHandle, name: String) -> Result<String, String> {
         })
         .map_err(|_| format!("No workflow called \u{201c}{key}\u{201d}. \u{201c}workflows\u{201d} lists what\u{2019}s saved."))?;
     let apps: Vec<String> = serde_json::from_str(&apps_json).unwrap_or_default();
+    // Skip apps already running — don't yank focus or duplicate windows.
+    let already: Vec<String> = running_apps().into_iter().map(|a| a.to_lowercase()).collect();
     for a in &apps {
-        let _ = Command::new("open").args(["-a", a]).spawn();
+        if !already.contains(&a.to_lowercase()) {
+            let _ = Command::new("open").args(["-a", a]).spawn();
+        }
     }
     // Restore browser tabs: open each URL in the browser that had it open.
     let tab_map: std::collections::HashMap<String, Vec<String>> = tabs_json

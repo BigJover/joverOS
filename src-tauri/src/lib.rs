@@ -1293,10 +1293,59 @@ fn list_grants(app: AppHandle) -> Result<String, String> {
 }
 
 // --- Workflows (M4): record the current session, replay it by name.
-// Recording = the apps open right now (System Events; one-time macOS
-// consent). Replaying = launch them all and let each app's own session
-// restore do the deep state — files, tabs, layout are the app's job,
-// and most modern apps do it well.
+// Recording = apps open right now (System Events) + tabs from Chrome/Safari
+// (AppleScript; Firefox has no tab API so gets plugin treatment later).
+// Replaying = launch all apps then reopen tab URLs in the right browser.
+
+fn chrome_tabs() -> Vec<String> {
+    let script = r#"tell application "Google Chrome"
+set out to {}
+repeat with w in windows
+    repeat with t in tabs of w
+        set end of out to (URL of t)
+    end repeat
+end repeat
+set AppleScript's text item delimiters to "\n"
+out as text
+end tell"#;
+    let o = std::process::Command::new("osascript").args(["-e", script]).output();
+    match o {
+        Ok(r) if r.status.success() => String::from_utf8_lossy(&r.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|u| u.starts_with("http"))
+            .map(str::to_string)
+            .collect(),
+        _ => vec![],
+    }
+}
+
+fn safari_tabs() -> Vec<String> {
+    let script = r#"tell application "Safari"
+set out to {}
+repeat with w in windows
+    try
+        repeat with t in tabs of w
+            try
+                set end of out to (URL of t)
+            end try
+        end repeat
+    end try
+end repeat
+set AppleScript's text item delimiters to "\n"
+out as text
+end tell"#;
+    let o = std::process::Command::new("osascript").args(["-e", script]).output();
+    match o {
+        Ok(r) if r.status.success() => String::from_utf8_lossy(&r.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|u| u.starts_with("http"))
+            .map(str::to_string)
+            .collect(),
+        _ => vec![],
+    }
+}
 
 fn running_apps() -> Vec<String> {
     let out = osa(
@@ -1332,45 +1381,79 @@ fn save_workflow(app: AppHandle, name: String) -> Result<String, String> {
     if apps.is_empty() {
         return Err("Couldn't see your open apps — macOS may have declined the System Events consent. Check System Settings → Privacy & Security → Automation.".into());
     }
+    let lower_apps: Vec<String> = apps.iter().map(|a| a.to_lowercase()).collect();
+    let mut tab_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    if lower_apps.iter().any(|a| a.contains("chrome")) {
+        let tabs = chrome_tabs();
+        if !tabs.is_empty() { tab_map.insert("chrome".into(), tabs); }
+    }
+    if lower_apps.iter().any(|a| a == "safari") {
+        let tabs = safari_tabs();
+        if !tabs.is_empty() { tab_map.insert("safari".into(), tabs); }
+    }
     let key = name.trim().to_lowercase();
     let conn = mem_db(&app)?;
+    let tabs_json = serde_json::to_string(&tab_map).unwrap_or_default();
     conn.execute(
-        "INSERT INTO workflows (name, apps) VALUES (?1, ?2)
-         ON CONFLICT(name) DO UPDATE SET apps = ?2, created = datetime('now')",
-        rusqlite::params![key, serde_json::to_string(&apps).unwrap_or_default()],
+        "INSERT INTO workflows (name, apps, tabs) VALUES (?1, ?2, ?3)
+         ON CONFLICT(name) DO UPDATE SET apps = ?2, tabs = ?3, created = datetime('now')",
+        rusqlite::params![key, serde_json::to_string(&apps).unwrap_or_default(), tabs_json],
     )
     .map_err(|e| e.to_string())?;
+    let tab_count: usize = tab_map.values().map(|v| v.len()).sum();
+    let tab_note = if tab_count > 0 {
+        let parts: Vec<String> = tab_map.iter()
+            .map(|(b, urls)| format!("{} {} tab{}", urls.len(), b, if urls.len() == 1 { "" } else { "s" }))
+            .collect();
+        format!(" + {}", parts.join(", "))
+    } else {
+        String::new()
+    };
+    let summary = format!("{}{tab_note}", apps.join(", "));
     let _ = conn.execute(
         "INSERT INTO history (action, detail) VALUES ('workflow_save', ?1)",
-        [format!("{key}: {}", apps.join(", "))],
+        [format!("{key}: {summary}")],
     );
-    Ok(format!("Saved workflow {key}: {}. Type “workflow {key}” to bring it all back.", apps.join(", ")))
+    Ok(format!("Saved workflow {key}: {summary}. Type \u{201c}workflow {key}\u{201d} to bring it all back."))
 }
 
 #[tauri::command]
 fn run_workflow(app: AppHandle, name: String) -> Result<String, String> {
     let key = name.trim().to_lowercase();
     let conn = mem_db(&app)?;
-    let apps_json: String = conn
-        .query_row("SELECT apps FROM workflows WHERE name = ?1", [&key], |r| r.get(0))
+    let (apps_json, tabs_json): (String, Option<String>) = conn
+        .query_row("SELECT apps, tabs FROM workflows WHERE name = ?1", [&key], |r| Ok((r.get(0)?, r.get(1)?)))
         .or_else(|_| {
             conn.query_row(
-                "SELECT apps FROM workflows WHERE name LIKE ?1 ORDER BY created DESC",
+                "SELECT apps, tabs FROM workflows WHERE name LIKE ?1 ORDER BY created DESC",
                 [format!("%{key}%")],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
         })
-        .map_err(|_| format!("No workflow called “{key}”. “workflows” lists what's saved."))?;
+        .map_err(|_| format!("No workflow called \u{201c}{key}\u{201d}. \u{201c}workflows\u{201d} lists what\u{2019}s saved."))?;
     let apps: Vec<String> = serde_json::from_str(&apps_json).unwrap_or_default();
     for a in &apps {
         let _ = Command::new("open").args(["-a", a]).spawn();
+    }
+    // Restore browser tabs: open each URL in the browser that had it open.
+    let tab_map: std::collections::HashMap<String, Vec<String>> = tabs_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
+    for (browser, urls) in &tab_map {
+        let app_name = if browser == "chrome" { "Google Chrome" } else { "Safari" };
+        for url in urls {
+            let _ = Command::new("open").args(["-a", app_name, url]).spawn();
+        }
     }
     let _ = conn.execute(
         "INSERT INTO history (action, detail) VALUES ('workflow_run', ?1)",
         [&key],
     );
     hide_bar(app);
-    Ok(format!("Workflow {key}: opening {}.", apps.join(", ")))
+    let tab_count: usize = tab_map.values().map(|v| v.len()).sum();
+    let tab_note = if tab_count > 0 { format!(" + {} tab{}", tab_count, if tab_count == 1 { "" } else { "s" }) } else { String::new() };
+    Ok(format!("Workflow {key}: opening {}{tab_note}.", apps.join(", ")))
 }
 
 #[tauri::command]
@@ -1460,11 +1543,14 @@ fn mem_db(app: &AppHandle) -> Result<rusqlite::Connection, String> {
         "CREATE TABLE IF NOT EXISTS workflows (
             name TEXT PRIMARY KEY,
             apps TEXT NOT NULL,
+            tabs TEXT,
             created TEXT NOT NULL DEFAULT (datetime('now'))
         )",
         [],
     )
     .map_err(|e| e.to_string())?;
+    // Migrate existing DB: add tabs column if it doesn't exist yet.
+    let _ = conn.execute("ALTER TABLE workflows ADD COLUMN tabs TEXT", []);
     conn.execute(
         "CREATE TABLE IF NOT EXISTS grants (
             scope TEXT PRIMARY KEY,

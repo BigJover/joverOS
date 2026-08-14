@@ -9,21 +9,16 @@ struct AppEntry {
     path: String,
 }
 
+#[cfg(target_os = "macos")]
 fn scan_dir(dir: &Path, out: &mut Vec<AppEntry>, depth: u8) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
+    let Ok(entries) = std::fs::read_dir(dir) else { return; };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "app") {
             if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                out.push(AppEntry {
-                    name: name.to_string(),
-                    path: path.to_string_lossy().into_owned(),
-                });
+                out.push(AppEntry { name: name.to_string(), path: path.to_string_lossy().into_owned() });
             }
         } else if depth > 0 && path.is_dir() {
-            // one level of subfolders catches /Applications/Utilities etc.
             scan_dir(&path, out, depth - 1);
         }
     }
@@ -31,28 +26,55 @@ fn scan_dir(dir: &Path, out: &mut Vec<AppEntry>, depth: u8) {
 
 #[tauri::command]
 fn list_apps() -> Vec<AppEntry> {
-    let mut dirs = vec![
-        String::from("/Applications"),
-        String::from("/System/Applications"),
-    ];
-    if let Ok(home) = std::env::var("HOME") {
-        dirs.push(format!("{home}/Applications"));
+    #[cfg(target_os = "macos")]
+    {
+        let mut dirs = vec!["/Applications".to_string(), "/System/Applications".to_string()];
+        if let Ok(h) = std::env::var("HOME") { dirs.push(format!("{h}/Applications")); }
+        let mut apps = Vec::new();
+        for dir in &dirs { scan_dir(Path::new(dir), &mut apps, 1); }
+        apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        apps.dedup_by(|a, b| a.path == b.path);
+        apps
     }
-    let mut apps = Vec::new();
-    for dir in &dirs {
-        scan_dir(Path::new(dir), &mut apps, 1);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut apps = Vec::new();
+        let mut dirs = vec!["/usr/share/applications".to_string(), "/usr/local/share/applications".to_string()];
+        if let Ok(h) = std::env::var("HOME") { dirs.push(format!("{h}/.local/share/applications")); }
+        for dir in &dirs {
+            let Ok(rd) = std::fs::read_dir(dir) else { continue; };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().is_some_and(|x| x == "desktop") {
+                    let Ok(text) = std::fs::read_to_string(&p) else { continue; };
+                    let mut name: Option<String> = None;
+                    let mut hidden = false;
+                    for line in text.lines() {
+                        if line.starts_with("Name=") && name.is_none() { name = Some(line[5..].to_string()); }
+                        if line == "NoDisplay=true" || line == "Hidden=true" { hidden = true; }
+                    }
+                    if let Some(n) = name { if !hidden { apps.push(AppEntry { name: n, path: p.to_string_lossy().into_owned() }); } }
+                }
+            }
+        }
+        apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        apps.dedup_by(|a, b| a.name == b.name);
+        apps
     }
-    apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    apps.dedup_by(|a, b| a.path == b.path);
-    apps
 }
 
 #[tauri::command]
 fn launch_app(app: AppHandle, path: String) -> Result<(), String> {
-    Command::new("open")
-        .arg(&path)
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    #[cfg(target_os = "macos")]
+    Command::new("open").arg(&path).spawn().map_err(|e| e.to_string())?;
+    #[cfg(not(target_os = "macos"))]
+    {
+        let stem = std::path::Path::new(&path).file_stem()
+            .and_then(|s| s.to_str()).unwrap_or(&path).to_string();
+        Command::new("gtk-launch").arg(&stem).spawn()
+            .or_else(|_| Command::new("xdg-open").arg(&path).spawn())
+            .map_err(|e| e.to_string())?;
+    }
     hide_bar(app);
     Ok(())
 }
@@ -151,11 +173,57 @@ struct FileHit {
     rank: u8,
 }
 
+#[cfg(target_os = "macos")]
 fn mdfind(args: &[&str]) -> Vec<String> {
-    Command::new("mdfind")
-        .args(args)
+    Command::new("mdfind").args(args).output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+fn plat_name(dir: &str, pat: &str) -> Vec<String> { mdfind(&["-onlyin", dir, "-name", pat]) }
+#[cfg(not(target_os = "macos"))]
+fn plat_name(dir: &str, pat: &str) -> Vec<String> {
+    Command::new("find")
+        .args([dir, "-iname", &format!("*{}*", pat), "-not", "-path", "*/.*", "-not", "-path", "*/node_modules/*"])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+#[cfg(target_os = "macos")]
+fn plat_content(dir: &str, q: &str, kind: &str) -> Vec<String> {
+    mdfind(&["-onlyin", dir, &format!("{} kind:{}", q, kind)])
+}
+#[cfg(not(target_os = "macos"))]
+fn plat_content(dir: &str, q: &str, _kind: &str) -> Vec<String> {
+    Command::new("grep")
+        .args(["-rl", "--include=*.txt", "--include=*.md", "--include=*.doc", "--include=*.docx", "-m", "1", q, dir])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+#[cfg(target_os = "macos")]
+fn plat_biggest(dir: &str) -> Vec<(String, f64)> {
+    Command::new("mdfind")
+        .args(["-onlyin", dir, "kMDItemFSSize > 1073741824", "-attr", "kMDItemFSSize"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| {
+            let (path, attr) = l.split_once("   kMDItemFSSize = ")?;
+            let bytes: f64 = attr.trim().parse().ok()?;
+            if path.rfind(".app/").is_some() { return None; }
+            Some((path.to_string(), bytes / 1e9))
+        }).collect())
+        .unwrap_or_default()
+}
+#[cfg(not(target_os = "macos"))]
+fn plat_biggest(dir: &str) -> Vec<(String, f64)> {
+    Command::new("find")
+        .args([dir, "-type", "f", "-size", "+1G", "-not", "-path", "*/.*"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter_map(|p| {
+            let gb = std::fs::metadata(p).ok()?.len() as f64 / 1e9;
+            Some((p.to_string(), gb))
+        }).collect())
         .unwrap_or_default()
 }
 
@@ -198,10 +266,10 @@ fn search_files(query: String, kind: Option<String>, since: Option<i64>, until: 
         .join(" ");
     let mut tiers = [0usize; 3]; // paths.len() after exact / stemmed / partial
     if !no_terms {
-        add_hits(mdfind(&["-onlyin", &home, "-name", &query]), &mut paths, cap);
+        add_hits(plat_name(&home, &query), &mut paths, cap);
         tiers[0] = paths.len();
         if stemmed != query {
-            add_hits(mdfind(&["-onlyin", &home, "-name", &stemmed]), &mut paths, cap);
+            add_hits(plat_name(&home, &stemmed), &mut paths, cap);
         }
         // A typed extension is a hint, not a requirement: "eva.jpeg" must
         // still find eva.jpg. Strip known extensions and search the bare
@@ -222,7 +290,7 @@ fn search_files(query: String, kind: Option<String>, since: Option<i64>, until: 
             .collect::<Vec<_>>()
             .join(" ");
         if bare != query && bare != stemmed {
-            add_hits(mdfind(&["-onlyin", &home, "-name", &bare]), &mut paths, cap);
+            add_hits(plat_name(&home, &bare), &mut paths, cap);
         }
         tiers[1] = paths.len();
     }
@@ -235,7 +303,7 @@ fn search_files(query: String, kind: Option<String>, since: Option<i64>, until: 
     if words.len() > 1 {
         let mut scored: Vec<(String, usize)> = Vec::new();
         for w in &words {
-            for p in mdfind(&["-onlyin", &home, "-name", w.trim_end_matches('s')]) {
+            for p in plat_name(&home, w.trim_end_matches('s')) {
                 if noise(&p) {
                     continue;
                 }
@@ -259,7 +327,7 @@ fn search_files(query: String, kind: Option<String>, since: Option<i64>, until: 
     if paths.is_empty() {
         let k = kind.as_deref().unwrap_or("document");
         add_hits(
-            mdfind(&["-onlyin", &home, &format!("{stemmed} kind:{k}").trim().to_string()]),
+            plat_content(&home, &stemmed, k),
             &mut paths,
             cap,
         );
@@ -592,23 +660,7 @@ fn diagnose_disk() -> Result<String, String> {
         out.push('\n');
     }
 
-    // Biggest items, straight from Spotlight's index — instant, and it
-    // sees inside app bundles the way a user thinks of them (one item).
-    let mut big: Vec<(String, f64)> = run(
-        "mdfind",
-        &["-onlyin", &home, "kMDItemFSSize > 1073741824", "-attr", "kMDItemFSSize"],
-    )
-    .lines()
-    .filter_map(|l| {
-        let (path, attr) = l.split_once("   kMDItemFSSize = ")?;
-        let bytes: f64 = attr.trim().parse().ok()?;
-        // an item inside a .app belongs to the app, not the list
-        if path.rfind(".app/").is_some() {
-            return None;
-        }
-        Some((path.to_string(), bytes / 1e9))
-    })
-    .collect();
+    let mut big: Vec<(String, f64)> = plat_biggest(&home);
     big.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     big.truncate(5);
     if !big.is_empty() {
@@ -638,63 +690,101 @@ fn sh(cmd: &str, args: &[&str]) -> String {
 // broken — that's the whole diagnosis a human expert would do.
 #[tauri::command]
 fn diagnose_wifi() -> Result<String, String> {
-    let hw = sh("networksetup", &["-listallhardwareports"]);
-    let dev = hw
-        .split("Hardware Port: Wi-Fi")
-        .nth(1)
-        .and_then(|s| s.lines().find_map(|l| l.trim().strip_prefix("Device: ")))
-        .unwrap_or("en0")
-        .to_string();
-    // networksetup lies on modern macOS ("not associated" while connected),
-    // and getsummary redacts the name without Location permission — so
-    // detect *connection* reliably and treat the name as a nice-to-have.
-    let ns = sh("networksetup", &["-getairportnetwork", &dev]);
-    let mut ssid = ns.trim().strip_prefix("Current Wi-Fi Network: ").map(str::to_string);
-    if ssid.is_none() {
-        ssid = sh("ipconfig", &["getsummary", &dev])
+    #[cfg(target_os = "macos")]
+    {
+        let hw = sh("networksetup", &["-listallhardwareports"]);
+        let dev = hw
+            .split("Hardware Port: Wi-Fi")
+            .nth(1)
+            .and_then(|s| s.lines().find_map(|l| l.trim().strip_prefix("Device: ")))
+            .unwrap_or("en0")
+            .to_string();
+        let ns = sh("networksetup", &["-getairportnetwork", &dev]);
+        let mut ssid = ns.trim().strip_prefix("Current Wi-Fi Network: ").map(str::to_string);
+        if ssid.is_none() {
+            ssid = sh("ipconfig", &["getsummary", &dev])
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("SSID : ").map(str::to_string));
+        }
+        let ip = sh("ipconfig", &["getifaddr", &dev]).trim().to_string();
+        let gw = sh("route", &["-n", "get", "default"])
             .lines()
-            .find_map(|l| l.trim().strip_prefix("SSID : ").map(str::to_string));
-    }
-    let ip = sh("ipconfig", &["getifaddr", &dev]).trim().to_string();
-    let gw = sh("route", &["-n", "get", "default"])
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("gateway: ").map(str::to_string))
-        .unwrap_or_default();
-    let ping_ok = |host: &str| sh("ping", &["-c", "1", "-t", "3", host]).contains(" 0.0% packet loss");
-    let gw_ok = !gw.is_empty() && ping_ok(&gw);
-    let net_ok = ping_ok("1.1.1.1");
-    let dns_ok = sh("dscacheutil", &["-q", "host", "-a", "name", "apple.com"]).contains("ip_address");
-
-    let mut out = String::new();
-    match &ssid {
-        Some(name) if name == "<redacted>" => {
-            out.push_str("Wi-Fi: connected (macOS hides the network name from apps).\n")
+            .find_map(|l| l.trim().strip_prefix("gateway: ").map(str::to_string))
+            .unwrap_or_default();
+        let ping_ok = |host: &str| sh("ping", &["-c", "1", "-t", "3", host]).contains(" 0.0% packet loss");
+        let gw_ok = !gw.is_empty() && ping_ok(&gw);
+        let net_ok = ping_ok("1.1.1.1");
+        let dns_ok = sh("dscacheutil", &["-q", "host", "-a", "name", "apple.com"]).contains("ip_address");
+        let mut out = String::new();
+        match &ssid {
+            Some(name) if name == "<redacted>" => out.push_str("Wi-Fi: connected (macOS hides the network name from apps).\n"),
+            Some(name) => out.push_str(&format!("Wi-Fi: connected to {name}.\n")),
+            None if !ip.is_empty() => out.push_str("Wi-Fi: not detected, but you have a network address — wired or shared connection.\n"),
+            None => out.push_str("Wi-Fi: not connected to any network.\n"),
         }
-        Some(name) => out.push_str(&format!("Wi-Fi: connected to {name}.\n")),
-        None if !ip.is_empty() => {
-            out.push_str("Wi-Fi: not detected, but you have a network address — wired or shared connection.\n")
-        }
-        None => out.push_str("Wi-Fi: not connected to any network.\n"),
+        out.push_str(&format!(
+            "Address from router: {} · Router: {} · Internet: {} · DNS: {}\n",
+            if ip.is_empty() { "none" } else { "yes" },
+            if gw_ok { "reachable" } else { "unreachable" },
+            if net_ok { "reachable" } else { "unreachable" },
+            if dns_ok { "working" } else { "failing" }
+        ));
+        out.push_str(if ssid.is_none() && ip.is_empty() {
+            "→ Join a Wi-Fi network from the menu bar."
+        } else if ip.is_empty() || !gw_ok {
+            "→ Your Mac can't talk to the router. Rejoin the network; if that fails, restart the router."
+        } else if !net_ok {
+            "→ Router is fine but the internet beyond it is down — modem or provider. Restart the modem; if it persists, it's your ISP."
+        } else if !dns_ok {
+            "→ Internet works but name lookups fail. Rejoining the network usually clears this."
+        } else {
+            "→ Network looks healthy end to end. If a site is failing, the problem is that site."
+        });
+        return Ok(out);
     }
-    out.push_str(&format!(
-        "Address from router: {} · Router: {} · Internet: {} · DNS: {}\n",
-        if ip.is_empty() { "none" } else { "yes" },
-        if gw_ok { "reachable" } else { "unreachable" },
-        if net_ok { "reachable" } else { "unreachable" },
-        if dns_ok { "working" } else { "failing" }
-    ));
-    out.push_str(if ssid.is_none() && ip.is_empty() {
-        "→ Join a Wi-Fi network from the menu bar."
-    } else if ip.is_empty() || !gw_ok {
-        "→ Your Mac can't talk to the router. Rejoin the network; if that fails, restart the router."
-    } else if !net_ok {
-        "→ Router is fine but the internet beyond it is down — modem or provider. Restart the modem; if it persists, it's your ISP."
-    } else if !dns_ok {
-        "→ Internet works but name lookups fail. Rejoining the network usually clears this."
-    } else {
-        "→ Network looks healthy end to end. If a site is failing, the problem is that site."
-    });
-    Ok(out)
+    #[cfg(not(target_os = "macos"))]
+    {
+        let ping_ok = |host: &str| sh("ping", &["-c", "1", "-W", "3", host]).contains(" 0% packet loss");
+        let nm = sh("nmcli", &["-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"]);
+        let wifi_line = nm.lines().find(|l| l.contains(":wifi:"));
+        let connected = wifi_line.map(|l| l.contains(":connected")).unwrap_or(false);
+        let ssid = wifi_line.and_then(|l| l.split(':').nth(3)).map(str::to_string);
+        let ip = sh("ip", &["-4", "-o", "addr", "show"]).lines()
+            .find(|l| !l.contains("lo ")).and_then(|l| l.split_whitespace().nth(3))
+            .map(|s| s.split('/').next().unwrap_or(s).to_string()).unwrap_or_default();
+        let gw = sh("ip", &["route", "show", "default"]).split_whitespace().nth(2)
+            .unwrap_or("").to_string();
+        let gw_ok = !gw.is_empty() && ping_ok(&gw);
+        let net_ok = ping_ok("1.1.1.1");
+        let dns_ok = !sh("getent", &["hosts", "archlinux.org"]).trim().is_empty();
+        let mut out = String::new();
+        if connected {
+            out.push_str(&format!("Wi-Fi: connected to {}\n", ssid.as_deref().unwrap_or("(unknown)")));
+        } else if !ip.is_empty() {
+            out.push_str("Wi-Fi: not detected, but you have a network address — wired or shared.\n");
+        } else {
+            out.push_str("Wi-Fi: not connected to any network.\n");
+        }
+        out.push_str(&format!(
+            "Address: {} · Router: {} · Internet: {} · DNS: {}\n",
+            if ip.is_empty() { "none" } else { "yes" },
+            if gw_ok { "reachable" } else { "unreachable" },
+            if net_ok { "reachable" } else { "unreachable" },
+            if dns_ok { "working" } else { "failing" }
+        ));
+        out.push_str(if !connected && ip.is_empty() {
+            "→ Join a Wi-Fi network from your network manager."
+        } else if !gw_ok {
+            "→ Can't reach the router. Rejoin the network or restart it."
+        } else if !net_ok {
+            "→ Router is fine but internet is down — restart your modem or contact ISP."
+        } else if !dns_ok {
+            "→ Internet works but name lookups fail. Try restarting NetworkManager."
+        } else {
+            "→ Network looks healthy."
+        });
+        return Ok(out);
+    }
 }
 
 #[tauri::command]
@@ -714,18 +804,30 @@ fn diagnose_slow() -> Result<String, String> {
     procs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     procs.truncate(3);
 
+    #[cfg(target_os = "macos")]
     let cores = sh("sysctl", &["-n", "hw.ncpu"]).trim().parse::<f32>().unwrap_or(1.0);
+    #[cfg(not(target_os = "macos"))]
+    let cores = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default()
+        .lines().filter(|l| l.starts_with("processor")).count() as f32;
+
+    #[cfg(target_os = "macos")]
     let load = sh("sysctl", &["-n", "vm.loadavg"])
-        .split_whitespace()
-        .nth(1)
-        .and_then(|x| x.parse::<f32>().ok())
-        .unwrap_or(0.0);
+        .split_whitespace().nth(1).and_then(|x| x.parse::<f32>().ok()).unwrap_or(0.0);
+    #[cfg(not(target_os = "macos"))]
+    let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default()
+        .split_whitespace().next().and_then(|x| x.parse::<f32>().ok()).unwrap_or(0.0);
+
+    #[cfg(target_os = "macos")]
     let swap_mb = sh("sysctl", &["-n", "vm.swapusage"])
-        .split("used = ")
-        .nth(1)
-        .and_then(|x| x.split('M').next())
-        .and_then(|x| x.trim().parse::<f32>().ok())
-        .unwrap_or(0.0);
+        .split("used = ").nth(1).and_then(|x| x.split('M').next())
+        .and_then(|x| x.trim().parse::<f32>().ok()).unwrap_or(0.0);
+    #[cfg(not(target_os = "macos"))]
+    let swap_mb = {
+        let mi = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+        let val = |key: &str| mi.lines().find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1)).and_then(|x| x.parse::<f32>().ok()).unwrap_or(0.0);
+        (val("SwapTotal:") - val("SwapFree:")) / 1024.0
+    };
     let free_gb = {
         let home = std::env::var("HOME").unwrap_or_default();
         sh("df", &["-k", &home])
@@ -809,46 +911,71 @@ fn diagnose_file(path: String) -> Result<String, String> {
 
 #[tauri::command]
 fn diagnose_audio() -> Result<String, String> {
-    let vol = sh("osascript", &["-e", "get volume settings"]);
-    let get = |key: &str| {
-        vol.split(&format!("{key}:"))
-            .nth(1)
-            .and_then(|x| x.split(&[',', '\n'][..]).next())
-            .map(|x| x.trim().to_string())
-            .unwrap_or_default()
-    };
-    let volume = get("output volume").parse::<i32>().unwrap_or(-1);
-    let muted = get("output muted") == "true";
-    let sp = sh("system_profiler", &["SPAudioDataType", "-detailLevel", "mini"]);
-    let output = sp
-        .split("Default Output Device: Yes")
-        .next()
-        .and_then(|before| {
-            before
-                .lines()
-                .rev()
+    #[cfg(target_os = "macos")]
+    {
+        let vol = sh("osascript", &["-e", "get volume settings"]);
+        let get = |key: &str| {
+            vol.split(&format!("{key}:"))
+                .nth(1)
+                .and_then(|x| x.split(&[',', '\n'][..]).next())
+                .map(|x| x.trim().to_string())
+                .unwrap_or_default()
+        };
+        let volume = get("output volume").parse::<i32>().unwrap_or(-1);
+        let muted = get("output muted") == "true";
+        let sp = sh("system_profiler", &["SPAudioDataType", "-detailLevel", "mini"]);
+        let output = sp.split("Default Output Device: Yes").next()
+            .and_then(|before| before.lines().rev()
                 .find(|l| l.ends_with(':') && !l.trim().is_empty() && !l.contains("Devices"))
-                .map(|l| l.trim().trim_end_matches(':').to_string())
-        })
-        .unwrap_or_else(|| "unknown".into());
-    let daemon_ok = !sh("pgrep", &["-x", "coreaudiod"]).trim().is_empty();
-
-    let mut out = format!(
-        "Output device: {output} · volume {volume}% · {}\n",
-        if muted { "MUTED" } else { "not muted" }
-    );
-    out.push_str(&if muted {
-        "→ Sound is muted — press F10 or raise the volume.".into()
-    } else if volume == 0 {
-        "→ Volume is at zero — turn it up.".into()
-    } else if !daemon_ok {
-        "→ The sound system (coreaudiod) isn't running — restarting the Mac fixes this.".into()
-    } else if output.to_lowercase().contains("display") || output.to_lowercase().contains("tv") {
-        format!("→ Sound is going to \"{output}\" (a screen), not speakers — switch the output device in Control Center.")
-    } else {
-        format!("→ Audio setup looks fine ({output}, {volume}%). If one app is silent, check its own volume; if everything is, try switching output devices in Control Center.")
-    });
-    Ok(out)
+                .map(|l| l.trim().trim_end_matches(':').to_string()))
+            .unwrap_or_else(|| "unknown".into());
+        let daemon_ok = !sh("pgrep", &["-x", "coreaudiod"]).trim().is_empty();
+        let mut out = format!(
+            "Output device: {output} · volume {volume}% · {}\n",
+            if muted { "MUTED" } else { "not muted" }
+        );
+        out.push_str(&if muted {
+            "â Sound is muted â press F10 or raise the volume.".into()
+        } else if volume == 0 {
+            "â Volume is at zero â turn it up.".into()
+        } else if !daemon_ok {
+            "â The sound system (coreaudiod) isn't running â restarting the Mac fixes this.".into()
+        } else if output.to_lowercase().contains("display") || output.to_lowercase().contains("tv") {
+            format!("â Sound is going to \"{output}\" (a screen), not speakers â switch the output device in Control Center.")
+        } else {
+            format!("â Audio setup looks fine ({output}, {volume}%). If one app is silent, check its own volume; if everything is, try switching output devices in Control Center.")
+        });
+        return Ok(out);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let pactl_vol = sh("pactl", &["get-sink-volume", "@DEFAULT_SINK@"]);
+        let volume: i32 = pactl_vol.split('%').next()
+            .and_then(|s| s.split_whitespace().last())
+            .and_then(|x| x.parse().ok()).unwrap_or(-1);
+        let muted = sh("pactl", &["get-sink-mute", "@DEFAULT_SINK@"]).contains("yes");
+        let sink = sh("pactl", &["info"]).lines()
+            .find(|l| l.starts_with("Default Sink:"))
+            .and_then(|l| l.split(':').nth(1)).map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "unknown".into());
+        let daemon_ok = !sh("pgrep", &["-x", "pipewire"]).trim().is_empty()
+            || !sh("pgrep", &["-x", "pulseaudio"]).trim().is_empty();
+        let vol_display = if volume < 0 { 0 } else { volume };
+        let mut out = format!(
+            "Output sink: {sink} · volume {vol_display}% · {}\n",
+            if muted { "MUTED" } else { "not muted" }
+        );
+        out.push_str(if muted {
+            "â Sound is muted â unmute with your volume keys or: pactl set-sink-mute @DEFAULT_SINK@ 0"
+        } else if volume == 0 {
+            "â Volume is at zero â turn it up."
+        } else if !daemon_ok {
+            "â Audio daemon not running â try: systemctl --user start pipewire"
+        } else {
+            "â Audio looks healthy. If an app is silent, check its own mixer channel."
+        });
+        return Ok(out);
+    }
 }
 
 // --- Settings (M3): volume and brightness. These run without a confirm
@@ -856,9 +983,10 @@ fn diagnose_audio() -> Result<String, String> {
 // 15"), it applies instantly, and the same command reverses it — the
 // confirmation layer is for operations the agent plans on your behalf.
 
-fn osa(script: &str) -> String {
-    sh("osascript", &["-e", script])
-}
+#[cfg(target_os = "macos")]
+fn osa(script: &str) -> String { sh("osascript", &["-e", script]) }
+#[cfg(not(target_os = "macos"))]
+fn osa(_script: &str) -> String { String::new() }
 
 fn level_from(action: &str, current: impl Fn() -> i32) -> Result<i32, String> {
     Ok(match action {
@@ -883,64 +1011,103 @@ fn set_volume(app: AppHandle, action: String) -> Result<String, String> {
             );
         }
     };
-    match action.as_str() {
-        "mute" => {
-            osa("set volume output muted true");
-            log("muted");
-            return Ok("Muted.".into());
+    #[cfg(target_os = "macos")]
+    {
+        match action.as_str() {
+            "mute" => { osa("set volume output muted true"); log("muted"); return Ok("Muted.".into()); }
+            "unmute" => { osa("set volume output muted false"); log("unmuted"); return Ok("Unmuted.".into()); }
+            _ => {}
         }
-        "unmute" => {
-            osa("set volume output muted false");
-            log("unmuted");
-            return Ok("Unmuted.".into());
+        let target = level_from(&action, || {
+            osa("output volume of (get volume settings)").trim().parse().unwrap_or(50)
+        })?;
+        osa(&format!("set volume output volume {target}"));
+        if target > 0 { osa("set volume output muted false"); }
+        log(&format!("{target}%"));
+        return Ok(format!("Volume {target}%."));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        match action.as_str() {
+            "mute" => {
+                let _ = Command::new("pactl").args(["set-sink-mute", "@DEFAULT_SINK@", "1"]).status();
+                log("muted"); return Ok("Muted.".into());
+            }
+            "unmute" => {
+                let _ = Command::new("pactl").args(["set-sink-mute", "@DEFAULT_SINK@", "0"]).status();
+                log("unmuted"); return Ok("Unmuted.".into());
+            }
+            _ => {}
         }
-        _ => {}
+        let target = level_from(&action, || {
+            let v = sh("pactl", &["get-sink-volume", "@DEFAULT_SINK@"]);
+            v.split('%').next().and_then(|s| s.split_whitespace().last())
+                .and_then(|x| x.parse().ok()).unwrap_or(50)
+        })?;
+        let _ = Command::new("pactl")
+            .args(["set-sink-volume", "@DEFAULT_SINK@", &format!("{target}%")]).status();
+        log(&format!("{target}%"));
+        return Ok(format!("Volume {target}%."));
     }
-    let target = level_from(&action, || {
-        osa("output volume of (get volume settings)").trim().parse().unwrap_or(50)
-    })?;
-    osa(&format!("set volume output volume {target}"));
-    // asking for a level means you want to hear it
-    if target > 0 {
-        osa("set volume output muted false");
-    }
-    log(&format!("{target}%"));
-    Ok(format!("Volume {target}%."))
 }
 
-// No public API for brightness — this is the same private DisplayServices
-// call the settings daemon uses (verified on this hardware). Fails soft.
+// No public API for brightness on macOS — uses private DisplayServices.
+// On Linux uses brightnessctl.
 #[tauri::command]
 fn set_brightness(app: AppHandle, action: String) -> Result<String, String> {
-    unsafe {
-        let cg = libc::dlopen(
-            c"/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics".as_ptr(),
-            libc::RTLD_LAZY,
-        );
-        let ds = libc::dlopen(
-            c"/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices".as_ptr(),
-            libc::RTLD_LAZY,
-        );
-        if cg.is_null() || ds.is_null() {
-            return Err("brightness control isn't available on this Mac".into());
+    #[cfg(target_os = "macos")]
+    {
+        let result = unsafe {
+            let cg = libc::dlopen(
+                c"/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics".as_ptr(),
+                libc::RTLD_LAZY,
+            );
+            let ds = libc::dlopen(
+                c"/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices".as_ptr(),
+                libc::RTLD_LAZY,
+            );
+            if cg.is_null() || ds.is_null() {
+                return Err("brightness control isn't available on this Mac".into());
+            }
+            let sym_main = libc::dlsym(cg, c"CGMainDisplayID".as_ptr());
+            let sym_get = libc::dlsym(ds, c"DisplayServicesGetBrightness".as_ptr());
+            let sym_set = libc::dlsym(ds, c"DisplayServicesSetBrightness".as_ptr());
+            if sym_main.is_null() || sym_get.is_null() || sym_set.is_null() {
+                return Err("brightness control isn't available on this Mac".into());
+            }
+            let main_id: extern "C" fn() -> u32 = std::mem::transmute(sym_main);
+            let get: extern "C" fn(u32, *mut f32) -> i32 = std::mem::transmute(sym_get);
+            let set: extern "C" fn(u32, f32) -> i32 = std::mem::transmute(sym_set);
+            let id = main_id();
+            let target = level_from(&action, || {
+                let mut cur = 0.5f32;
+                get(id, &mut cur);
+                (cur * 100.0).round() as i32
+            })?;
+            if set(id, target as f32 / 100.0) != 0 {
+                return Err("this display doesn't allow brightness control".into());
+            }
+            target
+        };
+        if let Ok(conn) = mem_db(&app) {
+            let _ = conn.execute(
+                "INSERT INTO history (action, detail) VALUES ('brightness', ?1)",
+                [format!("{result}%")],
+            );
         }
-        let sym_main = libc::dlsym(cg, c"CGMainDisplayID".as_ptr());
-        let sym_get = libc::dlsym(ds, c"DisplayServicesGetBrightness".as_ptr());
-        let sym_set = libc::dlsym(ds, c"DisplayServicesSetBrightness".as_ptr());
-        if sym_main.is_null() || sym_get.is_null() || sym_set.is_null() {
-            return Err("brightness control isn't available on this Mac".into());
-        }
-        let main_id: extern "C" fn() -> u32 = std::mem::transmute(sym_main);
-        let get: extern "C" fn(u32, *mut f32) -> i32 = std::mem::transmute(sym_get);
-        let set: extern "C" fn(u32, f32) -> i32 = std::mem::transmute(sym_set);
-        let id = main_id();
+        return Ok(format!("Brightness {result}%."));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
         let target = level_from(&action, || {
-            let mut cur = 0.5f32;
-            get(id, &mut cur);
-            (cur * 100.0).round() as i32
+            let cur = sh("brightnessctl", &["-m", "get"]);
+            let max_s = sh("brightnessctl", &["-m", "max"]);
+            let c: f32 = cur.trim().parse().unwrap_or(0.0);
+            let m: f32 = max_s.trim().parse().unwrap_or(1.0);
+            if m > 0.0 { (c / m * 100.0).round() as i32 } else { 50 }
         })?;
-        if set(id, target as f32 / 100.0) != 0 {
-            return Err("this display doesn't allow brightness control".into());
+        if Command::new("brightnessctl").args(["set", &format!("{target}%")]).status().is_err() {
+            return Err("brightnessctl not found -- install it to control brightness".into());
         }
         if let Ok(conn) = mem_db(&app) {
             let _ = conn.execute(
@@ -948,7 +1115,7 @@ fn set_brightness(app: AppHandle, action: String) -> Result<String, String> {
                 [format!("{target}%")],
             );
         }
-        Ok(format!("Brightness {target}%."))
+        return Ok(format!("Brightness {target}%."));
     }
 }
 
@@ -1068,7 +1235,7 @@ fn restore_named(app: AppHandle, what: String) -> Result<String, String> {
     let Some((id, src, dst)) = hit else {
         // most common reason there's nothing to restore: it's already home
         let home = std::env::var("HOME").unwrap_or_default();
-        if let Some(found) = mdfind(&["-onlyin", &home, "-name", &stem])
+        if let Some(found) = plat_name(&home, &stem)
             .into_iter()
             .find(|p| !noise(p))
         {
@@ -1077,13 +1244,19 @@ fn restore_named(app: AppHandle, what: String) -> Result<String, String> {
                 found.replacen(&home, "~", 1)
             ));
         }
-        // maybe it's in the system trash, just not ours
-        let names = osa("tell application \"Finder\" to get name of items in trash").to_lowercase();
-        return Ok(if names.contains(&stem) {
-            format!("“{what}” wasn't trashed by me — {SYS_TRASH_HINT}")
-        } else {
-            format!("I don't have “{what}” in my trash, and nothing like it is in the system Trash.")
-        });
+        #[cfg(target_os = "macos")]
+        {
+            let names = osa("tell application \"Finder\" to get name of items in trash").to_lowercase();
+            return Ok(if names.contains(&stem) {
+                format!("“{what}” wasn't trashed by me — {SYS_TRASH_HINT}")
+            } else {
+                format!("I don't have “{what}” in my trash, and nothing like it is in the system Trash.")
+            });
+        }
+        #[cfg(not(target_os = "macos"))]
+        return Ok(format!("I don't have “{what}” in my trash."));
+        #[allow(unreachable_code)]
+        return Ok(String::new());
     };
     let name = Path::new(src)
         .file_name()
@@ -1297,6 +1470,7 @@ fn list_grants(app: AppHandle) -> Result<String, String> {
 // (AppleScript; Firefox has no tab API so gets plugin treatment later).
 // Replaying = launch all apps then reopen tab URLs in the right browser.
 
+#[cfg(target_os = "macos")]
 fn chrome_tabs() -> Vec<String> {
     let script = r#"tell application "Google Chrome"
 set out to {}
@@ -1311,15 +1485,14 @@ end tell"#;
     let o = std::process::Command::new("osascript").args(["-e", script]).output();
     match o {
         Ok(r) if r.status.success() => String::from_utf8_lossy(&r.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|u| u.starts_with("http"))
-            .map(str::to_string)
-            .collect(),
+            .lines().map(str::trim).filter(|u| u.starts_with("http")).map(str::to_string).collect(),
         _ => vec![],
     }
 }
+#[cfg(not(target_os = "macos"))]
+fn chrome_tabs() -> Vec<String> { vec![] }
 
+#[cfg(target_os = "macos")]
 fn safari_tabs() -> Vec<String> {
     let script = r#"tell application "Safari"
 set out to {}
@@ -1338,30 +1511,40 @@ end tell"#;
     let o = std::process::Command::new("osascript").args(["-e", script]).output();
     match o {
         Ok(r) if r.status.success() => String::from_utf8_lossy(&r.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|u| u.starts_with("http"))
-            .map(str::to_string)
-            .collect(),
+            .lines().map(str::trim).filter(|u| u.starts_with("http")).map(str::to_string).collect(),
         _ => vec![],
     }
 }
+#[cfg(not(target_os = "macos"))]
+fn safari_tabs() -> Vec<String> { vec![] }
 
+#[cfg(target_os = "macos")]
 fn running_apps() -> Vec<String> {
     let out = osa(
         "tell application \"System Events\" to get name of (processes where background only is false)",
     );
-    if out.to_lowercase().contains("error") {
-        return Vec::new();
+    if out.to_lowercase().contains("error") { return Vec::new(); }
+    out.trim().split(", ").map(str::trim)
+        .filter(|a| !a.is_empty() && !["Finder", "joverOS", "joveros", "ai-os"].contains(a))
+        .map(str::to_string).collect()
+}
+#[cfg(not(target_os = "macos"))]
+fn running_apps() -> Vec<String> {
+    let wm = sh("wmctrl", &["-l", "-x"]);
+    if !wm.trim().is_empty() {
+        let mut apps: Vec<String> = wm.lines().filter_map(|l| {
+            let parts: Vec<&str> = l.splitn(5, char::is_whitespace).collect();
+            parts.get(3).map(|a| a.split('.').last().unwrap_or(a).to_string())
+        }).filter(|a| !a.is_empty()).collect();
+        apps.dedup();
+        return apps;
     }
-    out.trim()
-        .split(", ")
-        .map(str::trim)
-        .filter(|a| {
-            !a.is_empty() && !["Finder", "joverOS", "joveros", "ai-os"].contains(a)
-        })
-        .map(str::to_string)
-        .collect()
+    Command::new("ps").args(["-e", "-o", "comm="]).output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines()
+            .map(|l| l.rsplit('/').next().unwrap_or(l).to_string())
+            .filter(|a| !a.is_empty() && !["bash","sh","zsh","ps","grep"].contains(&a.as_str()))
+            .collect())
+        .unwrap_or_default()
 }
 
 #[tauri::command]
@@ -1717,11 +1900,20 @@ async fn open_url(
             target = fallback;
         }
     }
-    let mut cmd = Command::new("open");
-    if let Some(path) = &browser_path {
-        cmd.arg("-a").arg(path);
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = Command::new("open");
+        if let Some(path) = &browser_path { cmd.arg("-a").arg(path); }
+        cmd.arg(&target).spawn().map_err(|e| e.to_string())?;
     }
-    cmd.arg(&target).spawn().map_err(|e| e.to_string())?;
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(path) = &browser_path {
+            Command::new(path).arg(&target).spawn().map_err(|e| e.to_string())?;
+        } else {
+            Command::new("xdg-open").arg(&target).spawn().map_err(|e| e.to_string())?;
+        }
+    }
     hide_bar(app);
     Ok(target)
 }

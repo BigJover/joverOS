@@ -1259,6 +1259,235 @@ fn set_process_priority(app: AppHandle, name: String, level: String) -> Result<S
     Ok(format!("Set {name} to {label} priority."))
 }
 
+// --- Game Mode (M7) ──────────────────────────────────────────────────────────
+
+// Default background processes killed on "game mode on".
+// Apps that waste CPU/RAM while gaming but aren't needed.
+const DEFAULT_GAME_KILL: &[&str] = &[
+    "Discord", "Slack", "Microsoft Teams", "zoom.us", "Zoom",
+    "OneDrive", "Dropbox", "Google Drive",
+    "Adobe Creative Cloud", "Creative Cloud",
+    "Backblaze", "Backup and Sync",
+];
+
+#[tauri::command]
+fn game_mode_on(app: AppHandle, profile: Option<String>) -> Result<String, String> {
+    let conn = mem_db(&app)?;
+    // Already on?
+    let already: bool = conn.query_row(
+        "SELECT COUNT(*) FROM game_session WHERE active = 1", [],
+        |r| r.get::<_, i64>(0),
+    ).unwrap_or(0) > 0;
+    if already {
+        return Ok("Game mode is already on. Say \"game mode off\" to exit.".into());
+    }
+
+    // Load kill list — from profile or default.
+    let (kill_list, boost_proc): (Vec<String>, Option<String>) =
+        if let Some(ref p) = profile {
+            let lower = p.to_lowercase();
+            conn.query_row(
+                "SELECT kill_list, boost_process FROM game_profiles WHERE name = ?1",
+                [&lower],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .ok()
+            .and_then(|(kj, bp)| serde_json::from_str::<Vec<String>>(&kj).ok().map(|k| (k, bp)))
+            .unwrap_or_else(|| {
+                (DEFAULT_GAME_KILL.iter().map(|s| s.to_string()).collect(), Some(p.clone()))
+            })
+        } else {
+            (DEFAULT_GAME_KILL.iter().map(|s| s.to_string()).collect(), None)
+        };
+
+    // Kill background apps.
+    let mut killed: Vec<String> = Vec::new();
+    for name in &kill_list {
+        let out = Command::new("pgrep")
+            .args(["-i", "-l", name])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        for line in out.lines() {
+            let pid = line.split_whitespace().next().unwrap_or("").trim().to_string();
+            if pid.is_empty() { continue; }
+            if Command::new("kill").args(["-15", &pid]).status().is_ok() {
+                if !killed.contains(name) { killed.push(name.clone()); }
+            }
+        }
+    }
+
+    // Spawn caffeinate to keep the system awake (macOS) / store PID.
+    let caff_pid: Option<i64> = {
+        #[cfg(target_os = "macos")]
+        {
+            Command::new("caffeinate").args(["-dims"]).spawn().ok().map(|c| c.id() as i64)
+        }
+        #[cfg(not(target_os = "macos"))]
+        { None }
+    };
+
+    // Boost the game process priority if we know which one.
+    let mut boosted: Option<String> = None;
+    if let Some(ref bp) = boost_proc {
+        let pid_out = Command::new("pgrep")
+            .args(["-i", bp])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        if let Some(pid) = pid_out.lines().next().map(|l| l.trim().to_string()) {
+            if !pid.is_empty() {
+                let _ = Command::new("renice").args(["-n", "-10", &pid]).status();
+                boosted = Some(bp.clone());
+            }
+        }
+    }
+
+    // Persist session.
+    let killed_json = serde_json::to_string(&killed).unwrap_or_default();
+    conn.execute(
+        "INSERT INTO game_session (killed_apps, caff_pid) VALUES (?1, ?2)",
+        rusqlite::params![killed_json, caff_pid],
+    ).map_err(|e| e.to_string())?;
+
+    let profile_name = profile.as_deref().unwrap_or("default");
+    let mut out = format!("Game mode ON ({profile_name}).\n");
+    if killed.is_empty() {
+        out.push_str("Background apps weren't running — nothing to kill.");
+    } else {
+        out.push_str(&format!("Killed: {}.", killed.join(", ")));
+    }
+    if let Some(b) = boosted {
+        out.push_str(&format!("\nBoosted {b} to high priority."));
+    }
+    out.push_str("\nSay \"game mode off\" when you're done.");
+    Ok(out)
+}
+
+#[tauri::command]
+fn game_mode_off(app: AppHandle) -> Result<String, String> {
+    let conn = mem_db(&app)?;
+    let result = conn.query_row(
+        "SELECT id, killed_apps, caff_pid FROM game_session WHERE active = 1 ORDER BY id DESC LIMIT 1",
+        [],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?)),
+    );
+    let (session_id, killed_json, caff_pid) = match result {
+        Ok(r) => r,
+        Err(_) => return Ok("Game mode isn't on.".into()),
+    };
+    let killed: Vec<String> = serde_json::from_str(&killed_json).unwrap_or_default();
+
+    // Kill the caffeinate process.
+    if let Some(pid) = caff_pid {
+        let _ = Command::new("kill").args([&pid.to_string()]).status();
+    }
+
+    // Relaunch the killed apps.
+    let mut restored: Vec<String> = Vec::new();
+    for name in &killed {
+        #[cfg(target_os = "macos")]
+        let ok = Command::new("open").args(["-a", name]).status().map(|s| s.success()).unwrap_or(false);
+        #[cfg(not(target_os = "macos"))]
+        let ok = Command::new("gtk-launch").arg(name).status().map(|s| s.success()).unwrap_or(false);
+        if ok { restored.push(name.clone()); }
+    }
+
+    // Mark session closed.
+    let _ = conn.execute(
+        "UPDATE game_session SET active = 0 WHERE id = ?1",
+        [session_id],
+    );
+
+    let mut out = "Game mode OFF.\n".to_string();
+    if !restored.is_empty() {
+        out.push_str(&format!("Restored: {}.", restored.join(", ")));
+    } else if !killed.is_empty() {
+        out.push_str(&format!(
+            "Tried to restore: {} — check manually if any didn't open.", killed.join(", ")
+        ));
+    } else {
+        out.push_str("Nothing to restore.");
+    }
+    Ok(out)
+}
+
+// Save a game profile from the currently running apps — smart capture.
+// The named game is excluded from the kill list and tagged as the boost target.
+#[tauri::command]
+fn save_game_profile(app: AppHandle, name: String) -> Result<String, String> {
+    let lower = name.trim().to_lowercase();
+    let running = running_apps();
+    // Build kill list: running apps that aren't the game, the bar, or system procs.
+    let kill_list: Vec<String> = running.iter()
+        .filter(|a| {
+            let al = a.to_lowercase();
+            !is_protected(a) && !al.contains(&lower) && al != "joveros" && al != "ai-os"
+        })
+        .cloned()
+        .collect();
+    // Boost target: process matching the game name, or "java" for JVM games (Minecraft).
+    let boost = running.iter()
+        .find(|a| a.to_lowercase().contains(&lower))
+        .cloned()
+        .or_else(|| {
+            // Minecraft / JVM fallback
+            if lower.contains("minecraft") {
+                running.iter().find(|a| a.to_lowercase().contains("java")).cloned()
+            } else {
+                None
+            }
+        });
+    let final_kill: Vec<String> = if kill_list.is_empty() {
+        DEFAULT_GAME_KILL.iter().map(|s| s.to_string()).collect()
+    } else {
+        kill_list
+    };
+    let conn = mem_db(&app)?;
+    let kill_json = serde_json::to_string(&final_kill).map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO game_profiles (name, kill_list, boost_process) VALUES (?1, ?2, ?3)
+         ON CONFLICT(name) DO UPDATE SET kill_list = ?2, boost_process = ?3",
+        rusqlite::params![lower, kill_json, boost.as_deref()],
+    ).map_err(|e| e.to_string())?;
+    let mut out = format!("Saved profile \"{name}\".\n");
+    out.push_str(&format!("Will kill: {}.\n", final_kill.join(", ")));
+    if let Some(ref b) = boost {
+        out.push_str(&format!("Will boost: {b}."));
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+fn list_game_profiles(app: AppHandle) -> Result<String, String> {
+    let conn = mem_db(&app)?;
+    let mut stmt = conn
+        .prepare("SELECT name, kill_list, boost_process FROM game_profiles ORDER BY name")
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, String, Option<String>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    if rows.is_empty() {
+        return Ok(
+            "No saved profiles.\nDefault mode kills: ".to_string()
+                + &DEFAULT_GAME_KILL.join(", ")
+                + ".",
+        );
+    }
+    let mut out = "Game profiles:\n".to_string();
+    for (name, kill_json, boost) in &rows {
+        let kills: Vec<String> = serde_json::from_str(kill_json).unwrap_or_default();
+        out.push_str(&format!("  {name}: kills {}", kills.join(", ")));
+        if let Some(b) = boost {
+            out.push_str(&format!(" · boosts {b}"));
+        }
+        out.push('\n');
+    }
+    Ok(out.trim_end().to_string())
+}
+
 // The bar keeps its OWN trash. macOS lets apps script files INTO the
 // system Trash but blocks getting them OUT without Full Disk Access —
 // and TCC grants pin to the code signature, which changes every dev
@@ -1917,6 +2146,27 @@ fn mem_db(app: &AppHandle) -> Result<rusqlite::Connection, String> {
         [],
     )
     .map_err(|e| e.to_string())?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS game_profiles (
+            name TEXT PRIMARY KEY,
+            kill_list TEXT NOT NULL,
+            boost_process TEXT,
+            created TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS game_session (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            killed_apps TEXT NOT NULL,
+            caff_pid INTEGER,
+            active INTEGER NOT NULL DEFAULT 1,
+            started TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(conn)
 }
 
@@ -2149,7 +2399,11 @@ pub fn run() {
             kill_process,
             list_processes,
             port_lookup,
-            set_process_priority
+            set_process_priority,
+            game_mode_on,
+            game_mode_off,
+            save_game_profile,
+            list_game_profiles
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

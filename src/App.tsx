@@ -394,6 +394,35 @@ function App() {
         return;
       }
 
+      // Game Mode (M7)
+      // "game mode off"
+      if (/^game\s+mode\s+off$/i.test(t)) {
+        setStatus("exiting game mode…");
+        setReply(await invoke<string>("game_mode_off"));
+        return;
+      }
+      // "game mode on" / "game mode minecraft" / "game mode on for minecraft"
+      const gameModeM = t.match(/^game\s+mode\s+(?:on(?:\s+for\s+)?|for\s+)?(.*)$/i);
+      if (gameModeM) {
+        const profile = gameModeM[1].trim().toLowerCase() || null;
+        setStatus(profile ? `activating ${profile} mode…` : "activating game mode…");
+        setReply(await invoke<string>("game_mode_on", { profile: profile || undefined }));
+        return;
+      }
+      // "save game profile minecraft"
+      const saveProfileM = t.match(/^save\s+(?:game\s+)?profile\s+(.+)$/i);
+      if (saveProfileM) {
+        const name = saveProfileM[1].trim();
+        setStatus(`saving profile ${name}…`);
+        setReply(await invoke<string>("save_game_profile", { name }));
+        return;
+      }
+      // "game profiles" / "list game profiles" / "my game profiles"
+      if (/^(?:list\s+|show\s+|my\s+)?game\s+profiles?$/i.test(t)) {
+        setReply(await invoke<string>("list_game_profiles"));
+        return;
+      }
+
       // "kill chrome" / "force quit discord" / "terminate spotify"
       // Guard: skip if the word after kill looks like a pronoun/article
       const killM = t.match(/^(?:force\s+)?(?:kill|force\s+quit|terminate|end)\s+(?!the\b|my\b|it\b|that\b|a\b)(.+)$/i);

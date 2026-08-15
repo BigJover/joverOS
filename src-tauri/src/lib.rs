@@ -143,7 +143,7 @@ async fn route_intent(input: String) -> Result<Intent, String> {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
-            "intent": { "type": "string", "enum": ["app_launch", "web_open", "web_search", "file_search", "file_organize", "troubleshoot", "settings", "empty_trash", "file_trash", "history", "unknown"] },
+            "intent": { "type": "string", "enum": ["app_launch", "web_open", "web_search", "file_search", "file_organize", "troubleshoot", "settings", "empty_trash", "file_trash", "history", "process_kill", "process_list", "port_lookup", "process_priority", "unknown"] },
             "app": { "type": "string" },
             "query": { "type": "string" },
             "url": { "type": "string" },
@@ -1119,6 +1119,146 @@ fn set_brightness(app: AppHandle, action: String) -> Result<String, String> {
     }
 }
 
+// --- Process management (M6) ─────────────────────────────────────────────────
+
+// These processes are off-limits regardless of what the user asks.
+const PROTECTED_PROCS: &[&str] = &[
+    "kernel_task", "windowserver", "launchd", "loginwindow",
+    "systemuiserver", "dock", "finder", "joveros", "bash", "zsh", "sh",
+    "python3", "python", "cargo", "rustc",
+];
+
+fn is_protected(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    PROTECTED_PROCS.iter().any(|p| lower == *p || lower.contains(p))
+}
+
+#[tauri::command]
+fn kill_process(app: AppHandle, name: String, force: bool) -> Result<String, String> {
+    if is_protected(&name) {
+        return Err(format!("That's a system process — won't kill \"{name}\"."));
+    }
+    let out = Command::new("pgrep")
+        .args(["-i", "-l", &name])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    if out.trim().is_empty() {
+        return Ok(format!("No process matching \"{name}\" is running."));
+    }
+    let mut killed: Vec<String> = Vec::new();
+    for line in out.lines() {
+        let mut parts = line.splitn(2, ' ');
+        let pid = parts.next().unwrap_or("").trim().to_string();
+        let proc_name = parts.next().unwrap_or(name.as_str()).trim().to_string();
+        if pid.is_empty() || is_protected(&proc_name) { continue; }
+        let sig = if force { "-9" } else { "-15" };
+        if Command::new("kill").args([sig, &pid]).status().is_ok() {
+            killed.push(proc_name);
+        }
+    }
+    if killed.is_empty() {
+        return Ok(format!(
+            "Couldn't quit \"{name}\" — it may need force. Try: force kill {name}"
+        ));
+    }
+    if let Ok(conn) = mem_db(&app) {
+        let _ = conn.execute(
+            "INSERT INTO history (action, detail) VALUES ('kill_process', ?1)",
+            [format!("{} (force={})", killed.join(", "), force)],
+        );
+    }
+    let verb = if force { "Force-killed" } else { "Quit" };
+    Ok(format!("{verb}: {}.", killed.join(", ")))
+}
+
+#[tauri::command]
+fn list_processes() -> Result<String, String> {
+    let raw = sh("ps", &["-Areo", "pid,pcpu,pmem,comm"]);
+    let mut procs: Vec<(f32, f32, String)> = raw
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let cols: Vec<&str> = l.split_whitespace().collect();
+            if cols.len() < 4 { return None; }
+            let cpu: f32 = cols[1].parse().ok()?;
+            let mem: f32 = cols[2].parse().ok()?;
+            let name = cols[3..].join(" ");
+            let name = name.rsplit('/').next().unwrap_or(&name).to_string();
+            Some((cpu, mem, name))
+        })
+        .collect();
+    procs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    procs.dedup_by(|a, b| a.2 == b.2);
+    procs.truncate(8);
+    if procs.is_empty() {
+        return Ok("Nothing interesting running.".into());
+    }
+    let mut out = String::from("Top processes:\n");
+    for (cpu, mem, name) in &procs {
+        out.push_str(&format!("  {cpu:5.1}% CPU  {mem:4.1}% mem  {name}\n"));
+    }
+    out.push_str("Say \"kill <name>\" to quit one.");
+    Ok(out)
+}
+
+#[tauri::command]
+fn port_lookup(port: u16) -> Result<String, String> {
+    let out = sh("lsof", &["-i", &format!(":{port}"), "-n", "-P"]);
+    if out.trim().is_empty() || out.lines().count() <= 1 {
+        return Ok(format!("Nothing is using port {port}."));
+    }
+    let mut procs: Vec<String> = Vec::new();
+    for line in out.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 2 { continue; }
+        let entry = format!("{} (PID {})", cols[0], cols[1]);
+        if !procs.contains(&entry) { procs.push(entry); }
+    }
+    if procs.is_empty() {
+        return Ok(format!("Nothing is using port {port}."));
+    }
+    Ok(format!("Port {port}: {}.", procs.join(", ")))
+}
+
+#[tauri::command]
+fn set_process_priority(app: AppHandle, name: String, level: String) -> Result<String, String> {
+    if is_protected(&name) {
+        return Err(format!("Won't reprioritize system process \"{name}\"."));
+    }
+    let pid_out = Command::new("pgrep")
+        .args(["-i", &name])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let pid = pid_out.lines().next().unwrap_or("").trim().to_string();
+    if pid.is_empty() {
+        return Ok(format!("No process matching \"{name}\" is running."));
+    }
+    let (nice_val, label) = match level.to_lowercase().trim() {
+        "high" | "boost" | "max" => ("-10", "high"),
+        "low" | "background" | "idle" => ("10", "low"),
+        _ => ("0", "normal"),
+    };
+    let ok = Command::new("renice")
+        .args(["-n", nice_val, &pid])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        return Err(format!(
+            "Couldn't reprioritize \"{name}\" — boosting priority requires admin rights."
+        ));
+    }
+    if let Ok(conn) = mem_db(&app) {
+        let _ = conn.execute(
+            "INSERT INTO history (action, detail) VALUES ('process_priority', ?1)",
+            [format!("{name} → {label}")],
+        );
+    }
+    Ok(format!("Set {name} to {label} priority."))
+}
+
 // The bar keeps its OWN trash. macOS lets apps script files INTO the
 // system Trash but blocks getting them OUT without Full Disk Access —
 // and TCC grants pin to the code signature, which changes every dev
@@ -2005,7 +2145,11 @@ pub fn run() {
             resolve_web,
             recall_web,
             remember_web,
-            forget_web
+            forget_web,
+            kill_process,
+            list_processes,
+            port_lookup,
+            set_process_priority
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

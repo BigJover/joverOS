@@ -109,7 +109,7 @@ type OrganizePlan = { summary: string; moves: PlannedMove[] };
 type Pending = { exec: () => Promise<string> };
 
 type Intent = {
-  intent: "app_launch" | "web_open" | "web_search" | "file_search" | "file_organize" | "troubleshoot" | "settings" | "empty_trash" | "file_trash" | "file_delete" | "history" | "unknown";
+  intent: "app_launch" | "web_open" | "web_search" | "file_search" | "file_organize" | "troubleshoot" | "settings" | "empty_trash" | "file_trash" | "file_delete" | "history" | "process_kill" | "process_list" | "port_lookup" | "process_priority" | "unknown";
   app?: string;
   query?: string;
   url?: string;
@@ -353,8 +353,65 @@ function App() {
         setReply(await invoke<string>("list_grants"));
         return;
       }
-      // Workflows: precise names, deterministic grammar only.
+      // Process management (M6) — deterministic patterns, no LLM needed.
       const t = input.trim();
+
+      // "top processes" / "what's eating my cpu" / "what's running"
+      if (/^(?:top\s+processes?|what(?:'s|\s+is)\s+(?:using|eating)\s+(?:my\s+)?cpu|cpu\s+hogs?|show\s+processes?|what(?:'s|\s+is)\s+running\s+(?:right\s+now)?)$/i.test(t)) {
+        setStatus("checking processes…");
+        setReply(await invoke<string>("list_processes"));
+        return;
+      }
+
+      // "what's on port 3000" / "what's using port 8080" / "port 3000"
+      const portM = t.match(/^(?:what(?:'s|\s+is)\s+(?:on|using)\s+port\s+|port\s+)(\d+)$/i);
+      if (portM) {
+        const port = parseInt(portM[1]);
+        setStatus(`checking port ${port}…`);
+        setReply(await invoke<string>("port_lookup", { port }));
+        return;
+      }
+
+      // "set chrome to high priority" / "boost safari priority" / "lower discord priority"
+      const priorityM =
+        t.match(/^(?:set\s+)?(.+?)\s+to\s+(high|low|normal|background)\s+priority$/i) ??
+        t.match(/^(boost|prioritize)\s+(.+?)(?:\s+priority)?$/i) ??
+        t.match(/^(lower|deprioritize)\s+(.+?)(?:\s+priority)?$/i);
+      if (priorityM) {
+        let procName: string;
+        let level: string;
+        if (/^(boost|prioritize)/.test(priorityM[1] ?? "")) {
+          procName = priorityM[2].trim();
+          level = "high";
+        } else if (/^(lower|deprioritize)/.test(priorityM[1] ?? "")) {
+          procName = priorityM[2].trim();
+          level = "low";
+        } else {
+          procName = priorityM[1].trim();
+          level = (priorityM[2] ?? "normal").toLowerCase();
+        }
+        setReply(await invoke<string>("set_process_priority", { name: procName, level }));
+        return;
+      }
+
+      // "kill chrome" / "force quit discord" / "terminate spotify"
+      // Guard: skip if the word after kill looks like a pronoun/article
+      const killM = t.match(/^(?:force\s+)?(?:kill|force\s+quit|terminate|end)\s+(?!the\b|my\b|it\b|that\b|a\b)(.+)$/i);
+      if (killM) {
+        const procName = killM[1].trim();
+        const force = /^force/i.test(t);
+        const exec = () => invoke<string>("kill_process", { name: procName, force });
+        if (force) {
+          setPending({ exec });
+          setReply(`Force-kill "${procName}"? This is instant and can't be undone. Enter to confirm, Esc to cancel.`);
+        } else {
+          setPending({ exec });
+          setReply(`Quit "${procName}"? Enter to confirm, Esc to cancel.`);
+        }
+        return;
+      }
+
+      // Workflows: precise names, deterministic grammar only.
       const wfSave = t.match(/^(?:save|record)\b.*?\bas workflow\s+(.+)$/i) ?? t.match(/^(?:save|record) workflow\s+(.+)$/i);
       const wfDel = t.match(/^(?:delete|remove|forget) workflow\s+(.+)$/i);
       const wfRun = t.match(/^(?:run |open |load |start )?workflow\s+(.+)$/i);
@@ -566,6 +623,35 @@ function App() {
               );
             }
           }
+        }
+      } else if (intent.intent === "process_list") {
+        setStatus("checking processes…");
+        setReply(await invoke<string>("list_processes"));
+      } else if (intent.intent === "port_lookup") {
+        const port = parseInt(intent.query ?? "0");
+        if (!port) {
+          setReply("Which port? Try: what's on port 3000");
+        } else {
+          setStatus(`checking port ${port}…`);
+          setReply(await invoke<string>("port_lookup", { port }));
+        }
+      } else if (intent.intent === "process_kill") {
+        const procName = intent.app ?? intent.query ?? "";
+        if (!procName) {
+          setReply("Which process? Try: kill chrome");
+        } else {
+          const force = /force/i.test(input);
+          const exec = () => invoke<string>("kill_process", { name: procName, force });
+          setPending({ exec });
+          setReply(`Quit "${procName}"? Enter to confirm, Esc to cancel.`);
+        }
+      } else if (intent.intent === "process_priority") {
+        const procName = intent.app ?? "";
+        const level = intent.query ?? "normal";
+        if (!procName) {
+          setReply("Which process? Try: set chrome to high priority");
+        } else {
+          setReply(await invoke<string>("set_process_priority", { name: procName, level }));
         }
       } else if (intent.intent === "history") {
         setReply(await invoke<string>("get_history"));

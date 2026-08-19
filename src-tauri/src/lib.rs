@@ -1494,6 +1494,184 @@ fn list_game_profiles(app: AppHandle) -> Result<String, String> {
     Ok(out.trim_end().to_string())
 }
 
+// --- Media Controls (M8) ─────────────────────────────────────────────────────
+
+// Returns the first media app that is open (Spotify checked before Music).
+// Does NOT require it to be playing — used for shuffle/skip when paused.
+#[cfg(target_os = "macos")]
+fn open_media_app() -> Option<String> {
+    for app in &["Spotify", "Music"] {
+        let running = !Command::new("pgrep")
+            .args(["-xi", app])
+            .output()
+            .map(|o| o.stdout.is_empty())
+            .unwrap_or(true);
+        if running {
+            return Some(app.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn playing_media_app() -> Option<String> {
+    open_media_app().filter(|app| {
+        osa(&format!("tell application \"{}\" to player state as string", app))
+            .trim()
+            .to_lowercase()
+            == "playing"
+    })
+}
+
+#[tauri::command]
+fn media_control(action: String) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let app = open_media_app()
+            .ok_or_else(|| "No media app is open. Start Spotify or Apple Music first.".to_string())?;
+        let script = match action.as_str() {
+            "playpause" | "play" | "pause" => {
+                format!("tell application \"{}\" to playpause", app)
+            }
+            "next" => format!("tell application \"{}\" to next track", app),
+            "previous" => format!("tell application \"{}\" to previous track", app),
+            _ => return Err(format!("Unknown action: {action}")),
+        };
+        osa(&script);
+        let reply = match action.as_str() {
+            "next" => format!("Next track. [{app}]"),
+            "previous" => format!("Previous track. [{app}]"),
+            _ => {
+                let state = osa(&format!(
+                    "tell application \"{}\" to player state as string",
+                    app
+                ));
+                if state.trim().to_lowercase() == "playing" {
+                    format!("Playing. [{app}]")
+                } else {
+                    format!("Paused. [{app}]")
+                }
+            }
+        };
+        return Ok(reply);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let cmd = match action.as_str() {
+            "playpause" | "play" | "pause" => "play-pause",
+            "next" => "next",
+            "previous" => "previous",
+            _ => return Err(format!("Unknown action: {action}")),
+        };
+        if Command::new("playerctl").arg(cmd).status().map(|s| s.success()).unwrap_or(false) {
+            return Ok("Done.".into());
+        }
+        return Err("playerctl not found — install it to control media.".into());
+    }
+}
+
+#[tauri::command]
+fn media_skip(seconds: i32) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let app = playing_media_app()
+            .ok_or_else(|| "Nothing is playing.".to_string())?;
+        osa(&format!(
+            "tell application \"{}\" to set player position to (player position + {})",
+            app, seconds
+        ));
+        let dir = if seconds >= 0 { "forward" } else { "back" };
+        return Ok(format!("Skipped {} {}s. [{app}]", dir, seconds.unsigned_abs()));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // playerctl uses microseconds for seek offset
+        let micros = seconds as i64 * 1_000_000;
+        let offset = if micros >= 0 {
+            format!("+{micros}")
+        } else {
+            format!("{micros}")
+        };
+        if Command::new("playerctl").args(["position", &offset]).status().map(|s| s.success()).unwrap_or(false) {
+            let dir = if seconds >= 0 { "forward" } else { "back" };
+            return Ok(format!("Skipped {} {}s.", dir, seconds.unsigned_abs()));
+        }
+        return Err("playerctl not found.".into());
+    }
+}
+
+#[tauri::command]
+fn now_playing() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        for app in &["Spotify", "Music"] {
+            let running = !Command::new("pgrep")
+                .args(["-xi", app])
+                .output()
+                .map(|o| o.stdout.is_empty())
+                .unwrap_or(true);
+            if !running { continue; }
+            let state = osa(&format!("tell application \"{}\" to player state as string", app));
+            if state.trim().to_lowercase() != "playing" { continue; }
+            let info = osa(&format!(
+                "tell application \"{}\" to get {{name of current track, artist of current track, album of current track}}",
+                app
+            ));
+            let parts: Vec<&str> = info.trim().splitn(3, ", ").collect();
+            let title  = parts.first().copied().unwrap_or("Unknown").trim();
+            let artist = parts.get(1).copied().unwrap_or("Unknown").trim();
+            let album  = parts.get(2).copied().unwrap_or("").trim();
+            let pos_raw = osa(&format!("tell application \"{}\" to player position as integer", app));
+            let secs: u32 = pos_raw.trim().parse().unwrap_or(0);
+            let mut out = format!("{title} \u{2014} {artist}");
+            if !album.is_empty() { out.push_str(&format!(" \u{00b7} {album}")); }
+            out.push_str(&format!(" ({}:{:02}) [{app}]", secs / 60, secs % 60));
+            return Ok(out);
+        }
+        return Ok("Nothing is playing.".into());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let status = sh("playerctl", &["status"]).trim().to_lowercase();
+        if status != "playing" { return Ok("Nothing is playing.".into()); }
+        let title  = sh("playerctl", &["metadata", "title"]).trim().to_string();
+        let artist = sh("playerctl", &["metadata", "artist"]).trim().to_string();
+        let pos_us: u64 = sh("playerctl", &["metadata", "mpris:length"]).trim().parse().unwrap_or(0);
+        let secs = pos_us / 1_000_000;
+        return Ok(format!("{title} \u{2014} {artist} ({}:{:02})", secs / 60, secs % 60));
+    }
+}
+
+#[tauri::command]
+fn media_shuffle(on: bool) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let app = open_media_app()
+            .ok_or_else(|| "No media app is open.".to_string())?;
+        let script = match app.as_str() {
+            "Spotify" => format!(
+                "tell application \"Spotify\" to set shuffling to {}",
+                if on { "true" } else { "false" }
+            ),
+            "Music" => format!(
+                "tell application \"Music\" to set shuffle enabled to {}",
+                if on { "true" } else { "false" }
+            ),
+            _ => return Err("Shuffle not supported for this player.".into()),
+        };
+        osa(&script);
+        return Ok(format!("Shuffle {}. [{app}]", if on { "on" } else { "off" }));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let val = if on { "Shuffle" } else { "None" };
+        if Command::new("playerctl").args(["shuffle", val]).status().map(|s| s.success()).unwrap_or(false) {
+            return Ok(format!("Shuffle {}.", if on { "on" } else { "off" }));
+        }
+        return Err("playerctl not found.".into());
+    }
+}
+
 // The bar keeps its OWN trash. macOS lets apps script files INTO the
 // system Trash but blocks getting them OUT without Full Disk Access —
 // and TCC grants pin to the code signature, which changes every dev
@@ -2409,7 +2587,11 @@ pub fn run() {
             game_mode_on,
             game_mode_off,
             save_game_profile,
-            list_game_profiles
+            list_game_profiles,
+            media_control,
+            media_skip,
+            now_playing,
+            media_shuffle
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

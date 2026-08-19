@@ -394,6 +394,44 @@ function App() {
         return;
       }
 
+      // Media Controls (M8)
+      // "pause" / "play" / "resume" — standalone only, not "play spotify"
+      if (/^(?:pause|play|resume)$/i.test(t)) {
+        setReply(await invoke<string>("media_control", { action: "playpause" }));
+        return;
+      }
+      if (/^(?:next|next\s+(?:track|song)|skip\s+(?:track|song))$/i.test(t)) {
+        setReply(await invoke<string>("media_control", { action: "next" }));
+        return;
+      }
+      if (/^(?:previous|prev|previous\s+(?:track|song)|last\s+(?:track|song)|go\s+back\s+(?:a\s+)?(?:track|song))$/i.test(t)) {
+        setReply(await invoke<string>("media_control", { action: "previous" }));
+        return;
+      }
+      // "skip forward 30" / "skip 30" / "skip back 30" / "rewind 30"
+      const skipFwdM = t.match(/^(?:skip(?:\s+(?:forward|ahead))?|fast\s+forward)\s+(\d+)(?:\s+(?:seconds?|secs?))?$/i);
+      const skipBckM = t.match(/^(?:skip\s+back(?:ward)?|rewind)\s+(\d+)(?:\s+(?:seconds?|secs?))?$/i);
+      if (skipFwdM) {
+        setReply(await invoke<string>("media_skip", { seconds: parseInt(skipFwdM[1]) }));
+        return;
+      }
+      if (skipBckM) {
+        setReply(await invoke<string>("media_skip", { seconds: -parseInt(skipBckM[1]) }));
+        return;
+      }
+      // "what's playing" / "now playing" / "current song"
+      if (/^(?:what(?:'s|\s+is)\s+(?:playing|this\s+(?:song|track))|now\s+playing|current\s+(?:track|song|music))$/i.test(t)) {
+        setReply(await invoke<string>("now_playing"));
+        return;
+      }
+      // "shuffle on" / "shuffle off"
+      const shuffleM = t.match(/^shuffle\s+(on|off)$/i);
+      if (shuffleM) {
+        const on = shuffleM[1].toLowerCase() === "on";
+        setReply(await invoke<string>("media_shuffle", { on }));
+        return;
+      }
+
       // Game Mode (M7)
       // "game mode off"
       if (/^game\s+mode\s+off$/i.test(t)) {

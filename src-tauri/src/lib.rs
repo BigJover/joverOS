@@ -1263,8 +1263,9 @@ fn set_process_priority(app: AppHandle, name: String, level: String) -> Result<S
 
 // Default background processes killed on "game mode on".
 // Apps that waste CPU/RAM while gaming but aren't needed.
+// Discord intentionally excluded — it's used for voice chat while gaming.
 const DEFAULT_GAME_KILL: &[&str] = &[
-    "Discord", "Slack", "Microsoft Teams", "zoom.us", "Zoom",
+    "Slack", "Microsoft Teams", "zoom.us", "Zoom",
     "OneDrive", "Dropbox", "Google Drive",
     "Adobe Creative Cloud", "Creative Cloud",
     "Backblaze", "Backup and Sync",
@@ -1300,22 +1301,29 @@ fn game_mode_on(app: AppHandle, profile: Option<String>) -> Result<String, Strin
             (DEFAULT_GAME_KILL.iter().map(|s| s.to_string()).collect(), None)
         };
 
-    // Kill background apps.
-    let mut killed: Vec<String> = Vec::new();
+    // Pause background apps with SIGSTOP — they freeze in place and resume
+    // exactly where they left off on game mode off (no relaunch needed).
+    // Store {name, pids} so we can SIGCONT the exact same processes later.
+    let mut paused: Vec<serde_json::Value> = Vec::new();
     for name in &kill_list {
         let out = Command::new("pgrep")
-            .args(["-i", "-l", name])
+            .args(["-i", name])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
             .unwrap_or_default();
-        for line in out.lines() {
-            let pid = line.split_whitespace().next().unwrap_or("").trim().to_string();
-            if pid.is_empty() { continue; }
-            if Command::new("kill").args(["-15", &pid]).status().is_ok() {
-                if !killed.contains(name) { killed.push(name.clone()); }
-            }
+        let pids: Vec<String> = out.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if pids.is_empty() { continue; }
+        for pid in &pids {
+            let _ = Command::new("kill").args(["-STOP", pid]).status();
         }
+        paused.push(serde_json::json!({ "name": name, "pids": pids }));
     }
+    let killed: Vec<String> = paused.iter()
+        .filter_map(|e| e["name"].as_str().map(str::to_string))
+        .collect();
 
     // Spawn caffeinate to keep the system awake (macOS) / store PID.
     let caff_pid: Option<i64> = {
@@ -1343,19 +1351,19 @@ fn game_mode_on(app: AppHandle, profile: Option<String>) -> Result<String, Strin
         }
     }
 
-    // Persist session.
-    let killed_json = serde_json::to_string(&killed).unwrap_or_default();
+    // Persist session with PID list for exact SIGCONT later.
+    let paused_json = serde_json::to_string(&paused).unwrap_or_default();
     conn.execute(
         "INSERT INTO game_session (killed_apps, caff_pid) VALUES (?1, ?2)",
-        rusqlite::params![killed_json, caff_pid],
+        rusqlite::params![paused_json, caff_pid],
     ).map_err(|e| e.to_string())?;
 
     let profile_name = profile.as_deref().unwrap_or("default");
     let mut out = format!("Game mode ON ({profile_name}).\n");
     if killed.is_empty() {
-        out.push_str("Background apps weren't running — nothing to kill.");
+        out.push_str("Background apps weren't running — nothing to pause.");
     } else {
-        out.push_str(&format!("Killed: {}.", killed.join(", ")));
+        out.push_str(&format!("Paused: {}.", killed.join(", ")));
     }
     if let Some(b) = boosted {
         out.push_str(&format!("\nBoosted {b} to high priority."));
@@ -1376,21 +1384,23 @@ fn game_mode_off(app: AppHandle) -> Result<String, String> {
         Ok(r) => r,
         Err(_) => return Ok("Game mode isn't on.".into()),
     };
-    let killed: Vec<String> = serde_json::from_str(&killed_json).unwrap_or_default();
-
     // Kill the caffeinate process.
     if let Some(pid) = caff_pid {
         let _ = Command::new("kill").args([&pid.to_string()]).status();
     }
 
-    // Relaunch the killed apps.
-    let mut restored: Vec<String> = Vec::new();
-    for name in &killed {
-        #[cfg(target_os = "macos")]
-        let ok = Command::new("open").args(["-a", name]).status().map(|s| s.success()).unwrap_or(false);
-        #[cfg(not(target_os = "macos"))]
-        let ok = Command::new("gtk-launch").arg(name).status().map(|s| s.success()).unwrap_or(false);
-        if ok { restored.push(name.clone()); }
+    // Resume paused apps with SIGCONT — they continue exactly where they stopped.
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&killed_json).unwrap_or_default();
+    let mut resumed: Vec<String> = Vec::new();
+    for entry in &entries {
+        let name = entry["name"].as_str().unwrap_or("").to_string();
+        let pids = entry["pids"].as_array().cloned().unwrap_or_default();
+        for pid_val in &pids {
+            if let Some(pid) = pid_val.as_str() {
+                let _ = Command::new("kill").args(["-CONT", pid]).status();
+            }
+        }
+        if !name.is_empty() { resumed.push(name); }
     }
 
     // Mark session closed.
@@ -1400,14 +1410,10 @@ fn game_mode_off(app: AppHandle) -> Result<String, String> {
     );
 
     let mut out = "Game mode OFF.\n".to_string();
-    if !restored.is_empty() {
-        out.push_str(&format!("Restored: {}.", restored.join(", ")));
-    } else if !killed.is_empty() {
-        out.push_str(&format!(
-            "Tried to restore: {} — check manually if any didn't open.", killed.join(", ")
-        ));
+    if !resumed.is_empty() {
+        out.push_str(&format!("Resumed: {}.", resumed.join(", ")));
     } else {
-        out.push_str("Nothing to restore.");
+        out.push_str("Nothing to resume.");
     }
     Ok(out)
 }

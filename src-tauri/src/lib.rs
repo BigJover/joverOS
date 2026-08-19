@@ -1546,6 +1546,11 @@ fn media_control(action: String) -> Result<String, String> {
                     "tell application \"{}\" to player state as string",
                     app
                 ));
+                if state.trim().is_empty() {
+                    return Err(format!(
+                        "Couldn't control {app} — check System Settings → Privacy & Security → Automation and allow joverOS to control {app}."
+                    ));
+                }
                 if state.trim().to_lowercase() == "playing" {
                     format!("Playing. [{app}]")
                 } else {

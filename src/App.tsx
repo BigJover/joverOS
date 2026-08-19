@@ -395,8 +395,8 @@ function App() {
       }
 
       // Media Controls (M8)
-      // "pause" / "play" / "resume" — standalone only, not "play spotify"
-      if (/^(?:pause|play|resume)$/i.test(t)) {
+      // "pause" / "play" / "resume" — with optional app name ("play spotify")
+      if (/^(?:pause|play|resume)(?:\s+(?:spotify|music|apple\s*music))?$/i.test(t)) {
         setReply(await invoke<string>("media_control", { action: "playpause" }));
         return;
       }

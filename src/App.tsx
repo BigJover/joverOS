@@ -395,13 +395,29 @@ function App() {
       }
 
       // Media Controls (M8)
-      // "pause" / "play" / "resume" — with optional app name ("play spotify")
-      if (/^(?:pause|play|resume)(?:\s+(?:spotify|music|apple\s*music))?$/i.test(t)) {
-        setReply(await invoke<string>("media_control", { action: "playpause" }));
+      // "play" / "pause" / "resume" — optional native app name launches it if not open
+      // web-only services (soundcloud, youtube music, etc.) open in browser
+      const playM = t.match(/^(?:pause|play|resume)(?:\s+(spotify|music|apple\s*music|soundcloud|youtube\s*music|tidal|deezer|amazon\s*music))?$/i);
+      if (playM) {
+        const svc = (playM[1] ?? "").toLowerCase().replace(/\s+/g, "");
+        const webServices: Record<string, string> = {
+          soundcloud: "https://soundcloud.com",
+          youtubemusic: "https://music.youtube.com",
+          deezer: "https://www.deezer.com",
+        };
+        if (webServices[svc]) {
+          await invoke("open_url", { url: webServices[svc], browserPath: null, fallbackUrl: null });
+          setReply(`Opening ${playM[1]!} in browser.`);
+        } else {
+          const appArg = svc || undefined;
+          if (appArg) setStatus(`launching ${playM[1]}…`);
+          setReply(await invoke<string>("media_control", { action: "playpause", app: appArg }));
+        }
         return;
       }
-      if (/^(?:next|next\s+(?:track|song)|skip\s+(?:track|song))$/i.test(t)) {
-        setReply(await invoke<string>("media_control", { action: "next" }));
+      // "next" / "skip" / "skip track" / "skip song"
+      if (/^(?:next|next\s+(?:track|song)|skip(?:\s+(?:track|song))?)$/i.test(t)) {
+        setReply(await invoke<string>("media_control", { action: "next", app: undefined }));
         return;
       }
       if (/^(?:previous|prev|previous\s+(?:track|song)|last\s+(?:track|song)|go\s+back\s+(?:a\s+)?(?:track|song))$/i.test(t)) {

@@ -1524,11 +1524,33 @@ fn playing_media_app() -> Option<String> {
 }
 
 #[tauri::command]
-fn media_control(action: String) -> Result<String, String> {
+fn media_control(action: String, app: Option<String>) -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
-        let app = open_media_app()
-            .ok_or_else(|| "No media app is open. Start Spotify or Apple Music first.".to_string())?;
+        // Normalize requested app name to the real macOS app name.
+        let requested = app.as_deref().map(|a| match a.to_lowercase().replace(' ', "").as_str() {
+            "spotify"               => "Spotify",
+            "music" | "applemusic" => "Music",
+            _                      => "Spotify", // unknown → try Spotify
+        }.to_string());
+
+        // Launch the requested app if it isn't already running.
+        if let Some(ref name) = requested {
+            let running = !Command::new("pgrep")
+                .args(["-xi", name])
+                .output()
+                .map(|o| o.stdout.is_empty())
+                .unwrap_or(true);
+            if !running {
+                let _ = Command::new("open").args(["-a", name]).status();
+                // Give the app time to initialize before sending AppleScript.
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            }
+        }
+
+        let app = requested
+            .or_else(open_media_app)
+            .ok_or_else(|| "No media app is open. Say 'play spotify' to launch one.".to_string())?;
         let script = match action.as_str() {
             "playpause" | "play" | "pause" => {
                 format!("tell application \"{}\" to playpause", app)

@@ -397,7 +397,7 @@ function App() {
       // Media Controls (M8)
       // "play" / "pause" / "resume" — optional native app name launches it if not open
       // web-only services (soundcloud, youtube music, etc.) open in browser
-      const playM = t.match(/^(?:pause|play|resume)(?:\s+(spotify|music|apple\s*music|soundcloud|youtube\s*music|tidal|deezer|amazon\s*music))?$/i);
+      const playM = t.match(/^(?:pause|play|resume)(?:\s+(spotify|apple\s+music|soundcloud|youtube\s*music|tidal|deezer|amazon\s*music))?$/i);
       if (playM) {
         const svc = (playM[1] ?? "").toLowerCase().replace(/\s+/g, "");
         const webServices: Record<string, string> = {

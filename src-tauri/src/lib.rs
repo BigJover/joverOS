@@ -1746,8 +1746,20 @@ async fn try_play_spotify(client: &reqwest::Client, query: &str, client_id: &str
     let name   = track["name"].as_str().unwrap_or(query);
     let artist = track["artists"][0]["name"].as_str().unwrap_or("Unknown");
 
-    // Open the spotify: URI — Spotify desktop app plays it immediately.
-    let _ = Command::new("open").arg(uri).status();
+    // Make sure Spotify is open before sending AppleScript.
+    let spotify_running = !Command::new("pgrep").args(["-xi", "Spotify"])
+        .output().map(|o| o.stdout.is_empty()).unwrap_or(true);
+    if !spotify_running {
+        let _ = Command::new("open").args(["-a", "Spotify"]).status();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    }
+
+    // AppleScript play track directly — more reliable than URI scheme.
+    #[cfg(target_os = "macos")]
+    osa(&format!("tell application \"Spotify\" to play track \"{}\"", uri));
+    #[cfg(not(target_os = "macos"))]
+    { let _ = Command::new("open").arg(uri).status(); }
+
     Ok(format!("{name} \u{2014} {artist} [Spotify]"))
 }
 

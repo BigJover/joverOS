@@ -440,6 +440,31 @@ function App() {
         setReply(await invoke<string>("now_playing"));
         return;
       }
+      // "play [song] on spotify/apple music" — specific app requested
+      const playOnM = t.match(/^play\s+(.+?)\s+on\s+(spotify|apple\s+music|music)$/i);
+      if (playOnM) {
+        const query = playOnM[1].trim();
+        const preferApp = playOnM[2].trim().toLowerCase();
+        setStatus(`searching ${preferApp}…`);
+        setReply(await invoke<string>("play_track", { query, preferApp }));
+        return;
+      }
+      // "play [song]" — use whatever music app is open, YouTube fallback
+      // Guard: don't catch bare service names (those are handled by playM above)
+      const MEDIA_SERVICES = /^(?:spotify|apple\s+music|soundcloud|youtube\s*music|tidal|deezer|amazon\s*music)$/i;
+      const playTrackM = t.match(/^play\s+(.+)$/i);
+      if (playTrackM && !MEDIA_SERVICES.test(playTrackM[1].trim())) {
+        const query = playTrackM[1].trim();
+        setStatus(`searching for ${query}…`);
+        setReply(await invoke<string>("play_track", { query, preferApp: undefined }));
+        return;
+      }
+      // "setup spotify CLIENT_ID CLIENT_SECRET"
+      const setupSpotifyM = t.match(/^(?:setup|configure|set up)\s+spotify\s+(\S+)\s+(\S+)$/i);
+      if (setupSpotifyM) {
+        setReply(await invoke<string>("setup_spotify", { clientId: setupSpotifyM[1], clientSecret: setupSpotifyM[2] }));
+        return;
+      }
       // "shuffle on" / "shuffle off"
       const shuffleM = t.match(/^shuffle\s+(on|off)$/i);
       if (shuffleM) {

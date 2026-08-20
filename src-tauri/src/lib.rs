@@ -1699,6 +1699,133 @@ fn media_shuffle(on: bool) -> Result<String, String> {
     }
 }
 
+// --- Play Track (M8b) — search + play a specific song ───────────────────────
+
+#[tauri::command]
+fn setup_spotify(app: AppHandle, client_id: String, client_secret: String) -> Result<String, String> {
+    let db = mem_db(&app).map_err(|e| e.to_string())?;
+    kv_set(&db, "spotify_client_id", &client_id);
+    kv_set(&db, "spotify_client_secret", &client_secret);
+    Ok("Spotify credentials saved. Try 'play [song name] on spotify' now.".into())
+}
+
+async fn try_play_spotify(client: &reqwest::Client, query: &str, client_id: &str, client_secret: &str) -> Result<String, String> {
+    // Client Credentials token (no user login required).
+    let token_resp = client
+        .post("https://accounts.spotify.com/api/token")
+        .basic_auth(client_id, Some(client_secret))
+        .form(&[("grant_type", "client_credentials")])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let token = token_resp["access_token"]
+        .as_str()
+        .ok_or_else(|| "Spotify auth failed — check your client ID and secret.".to_string())?;
+
+    let enc = urlencoding::encode(query);
+    let search = client
+        .get(format!("https://api.spotify.com/v1/search?q={enc}&type=track&limit=1"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let track = &search["tracks"]["items"][0];
+    if track.is_null() {
+        return Err(format!("No Spotify track found for '{query}'."));
+    }
+
+    let uri    = track["uri"].as_str().ok_or("missing track uri")?;
+    let name   = track["name"].as_str().unwrap_or(query);
+    let artist = track["artists"][0]["name"].as_str().unwrap_or("Unknown");
+
+    // Open the spotify: URI — Spotify desktop app plays it immediately.
+    let _ = Command::new("open").arg(uri).status();
+    Ok(format!("{name} \u{2014} {artist} [Spotify]"))
+}
+
+#[tauri::command]
+async fn play_track(app: AppHandle, query: String, prefer_app: Option<String>) -> Result<String, String> {
+    let prefer = prefer_app.as_deref().map(|s| s.to_lowercase().replace(' ', ""));
+
+    let want_spotify = prefer.as_deref() == Some("spotify");
+    let want_music   = matches!(prefer.as_deref(), Some("music") | Some("applemusic"));
+
+    #[cfg(target_os = "macos")]
+    let spotify_open = !Command::new("pgrep").args(["-xi", "Spotify"])
+        .output().map(|o| o.stdout.is_empty()).unwrap_or(true);
+    #[cfg(not(target_os = "macos"))]
+    let spotify_open = false;
+
+    #[cfg(target_os = "macos")]
+    let music_open = !Command::new("pgrep").args(["-xi", "Music"])
+        .output().map(|o| o.stdout.is_empty()).unwrap_or(true);
+    #[cfg(not(target_os = "macos"))]
+    let music_open = false;
+
+    let use_spotify = want_spotify || (!want_music && spotify_open);
+    let use_music   = want_music   || (!want_spotify && !spotify_open && music_open);
+
+    let http = reqwest::Client::new();
+
+    // --- Spotify path ---
+    if use_spotify {
+        let db = mem_db(&app).map_err(|e| e.to_string())?;
+        if let (Some(id), Some(secret)) = (kv_get(&db, "spotify_client_id"), kv_get(&db, "spotify_client_secret")) {
+            match try_play_spotify(&http, &query, &id, &secret).await {
+                Ok(msg) => return Ok(msg),
+                Err(e)  => {
+                    // API failed — fall back to in-app search.
+                    let enc = urlencoding::encode(&query);
+                    let _ = Command::new("open").arg(format!("spotify:search:{enc}")).status();
+                    return Ok(format!("Opened Spotify search for '{query}'. ({e})"));
+                }
+            }
+        } else {
+            // No credentials — open in-app search, remind user to set up.
+            let enc = urlencoding::encode(&query);
+            let _ = Command::new("open").arg(format!("spotify:search:{enc}")).status();
+            return Ok(format!(
+                "Opened Spotify search for '{query}'. \
+                 For auto-play, say: setup spotify CLIENT_ID CLIENT_SECRET"
+            ));
+        }
+    }
+
+    // --- Apple Music path (local library) ---
+    #[cfg(target_os = "macos")]
+    if use_music {
+        let safe = query.replace('"', "'");
+        let result = osa(&format!(
+            r#"tell application "Music"
+                set res to search playlist "Library" for "{safe}"
+                if (count of res) > 0 then
+                    play (item 1 of res)
+                    return (name of item 1 of res) & " — " & (artist of item 1 of res)
+                end if
+                return ""
+            end tell"#
+        ));
+        if !result.trim().is_empty() {
+            return Ok(format!("{} [Apple Music]", result.trim()));
+        }
+        // Not in library — fall through to YouTube.
+    }
+
+    // --- YouTube fallback ---
+    let enc = urlencoding::encode(&query);
+    let url = format!("https://www.youtube.com/results?search_query={enc}");
+    let _ = Command::new("open").arg(&url).status();
+    Ok(format!("Opening YouTube search for '{query}'."))
+}
+
 // The bar keeps its OWN trash. macOS lets apps script files INTO the
 // system Trash but blocks getting them OUT without Full Disk Access —
 // and TCC grants pin to the code signature, which changes every dev
@@ -2378,7 +2505,26 @@ fn mem_db(app: &AppHandle) -> Result<rusqlite::Connection, String> {
         [],
     )
     .map_err(|e| e.to_string())?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS kv (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(conn)
+}
+
+fn kv_get(conn: &rusqlite::Connection, key: &str) -> Option<String> {
+    conn.query_row("SELECT value FROM kv WHERE key=?1", [key], |r| r.get(0)).ok()
+}
+
+fn kv_set(conn: &rusqlite::Connection, key: &str, value: &str) {
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
+        [key, value],
+    );
 }
 
 fn normalize_input(input: &str) -> String {
@@ -2618,7 +2764,9 @@ pub fn run() {
             media_control,
             media_skip,
             now_playing,
-            media_shuffle
+            media_shuffle,
+            play_track,
+            setup_spotify
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

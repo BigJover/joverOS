@@ -914,7 +914,7 @@ function App() {
       return;
     }
     if (e.key === "Escape") {
-      getCurrentWindow().hide();
+      invoke("hide_bar");
     } else if (e.key === "ArrowDown") {
       e.preventDefault();
       setSelected((s) => Math.min(s + 1, (files.length || results.length) - 1));

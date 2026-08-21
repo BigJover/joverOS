@@ -1740,27 +1740,22 @@ fn window_manage(action: String, app_name: Option<String>) -> Result<String, Str
             }
             "minimize" => {
                 if proc.is_empty() { return Err("Specify an app to minimize.".into()); }
+                // Direct app scripting — no Accessibility needed for scriptable apps.
                 osa(&format!(
-                    r#"tell application "{proc}" to activate
-                    tell application "System Events"
-                        tell process "{proc}"
-                            set miniaturized of window 1 to true
-                        end tell
+                    r#"tell application "{proc}"
+                        activate
+                        set miniaturized of window 1 to true
                     end tell"#
                 ));
                 return Ok(format!("Minimized {proc}."));
             }
             "hide" => {
                 if proc.is_empty() { return Err("Specify an app to hide.".into()); }
-                osa(&format!(
-                    "tell application \"System Events\" to set visible of process \"{}\" to false",
-                    proc
-                ));
+                osa(&format!("tell application \"{}\" to set visible of every window to false", proc));
                 return Ok(format!("Hid {proc}."));
             }
             "hide_all" => {
-                // Cmd+Option+H hides all background apps, keeping the frontmost visible.
-                osa(r#"tell application "System Events" to keystroke "h" using {command down, option down}"#);
+                osa(r#"tell application "Finder" to set visible of every process to false"#);
                 return Ok("Hid background windows.".into());
             }
             "show" => {
@@ -1774,12 +1769,11 @@ fn window_manage(action: String, app_name: Option<String>) -> Result<String, Str
             }
             "fullscreen" => {
                 if proc.is_empty() { return Err("Specify an app.".into()); }
+                // zoomed fills the screen without needing Accessibility.
                 osa(&format!(
-                    r#"tell application "{proc}" to activate
-                    tell application "System Events"
-                        tell process "{proc}"
-                            keystroke "f" using {{control down, command down}}
-                        end tell
+                    r#"tell application "{proc}"
+                        activate
+                        set zoomed of window 1 to not zoomed of window 1
                     end tell"#
                 ));
                 return Ok(format!("Toggled fullscreen for {proc}."));
@@ -1802,12 +1796,11 @@ fn window_manage(action: String, app_name: Option<String>) -> Result<String, Str
                     }
                     _ => unreachable!()
                 };
+                // Direct app scripting first — works without Accessibility for scriptable apps.
                 osa(&format!(
-                    r#"tell application "{proc}" to activate
-                    tell application "System Events"
-                        tell process "{proc}"
-                            set bounds of window 1 to {{{l}, {t}, {r}, {b}}}
-                        end tell
+                    r#"tell application "{proc}"
+                        activate
+                        set bounds of window 1 to {{{l}, {t}, {r}, {b}}}
                     end tell"#
                 ));
                 let label = snap.replace("snap_", "");

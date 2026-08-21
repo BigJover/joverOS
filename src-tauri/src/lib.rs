@@ -1726,13 +1726,13 @@ fn proc_name(app: &str) -> String {
 }
 
 #[tauri::command]
-fn window_manage(app: AppHandle, action: String, app_name: Option<String>) -> Result<String, String> {
+fn window_manage(action: String, app_name: Option<String>) -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
         let raw_app = app_name.as_deref().unwrap_or("").trim().to_string();
         let proc = proc_name(&raw_app);
 
-        let result = (|| -> Result<String, String> { match action.as_str() {
+        match action.as_str() {
             "focus" => {
                 if proc.is_empty() { return Err("Specify an app to focus.".into()); }
                 osa(&format!("tell application \"{}\" to activate", proc));
@@ -1808,12 +1808,7 @@ fn window_manage(app: AppHandle, action: String, app_name: Option<String>) -> Re
                 return Ok(format!("Snapped {proc} to the {label}."));
             }
             _ => return Err(format!("Unknown window action: {action}")),
-        }})();
-        // Refocus the bar so activating another app doesn't steal the input.
-        if let Some(win) = app.get_webview_window("main") {
-            let _ = win.set_focus();
         }
-        return result;
     }
     #[cfg(not(target_os = "macos"))]
     {

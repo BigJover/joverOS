@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 
@@ -1699,6 +1700,9 @@ fn media_shuffle(on: bool) -> Result<String, String> {
     }
 }
 
+// Suppresses the focus-loss hide while window commands temporarily steal focus.
+static SUPPRESS_FOCUS_HIDE: AtomicBool = AtomicBool::new(false);
+
 // --- Window Management (M9) ──────────────────────────────────────────────────
 
 #[cfg(target_os = "macos")]
@@ -1732,6 +1736,7 @@ fn window_manage(app: AppHandle, action: String, app_name: Option<String>) -> Re
         let raw_app = app_name.as_deref().unwrap_or("").trim().to_string();
         let proc = proc_name(&raw_app);
 
+        SUPPRESS_FOCUS_HIDE.store(true, Ordering::SeqCst);
         let result = (|| -> Result<String, String> { match action.as_str() {
             "focus" => {
                 if proc.is_empty() { return Err("Specify an app to focus.".into()); }
@@ -1809,10 +1814,11 @@ fn window_manage(app: AppHandle, action: String, app_name: Option<String>) -> Re
             }
             _ => return Err(format!("Unknown window action: {action}")),
         }})();
-        // Refocus the bar so activating another app doesn't steal the input.
+        // Refocus the bar, then re-enable focus-loss hiding.
         if let Some(win) = app.get_webview_window("main") {
             let _ = win.set_focus();
         }
+        SUPPRESS_FOCUS_HIDE.store(false, Ordering::SeqCst);
         return result;
     }
     #[cfg(not(target_os = "macos"))]
@@ -2832,17 +2838,28 @@ fn toggle_bar(app: &AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .plugin(
+        .plugin({
+            // Debounce: ignore key-repeat events so holding Option+Space
+            // doesn't rapidly toggle the bar.
+            static HOTKEY_ACTIVE: AtomicBool = AtomicBool::new(false);
             tauri_plugin_global_shortcut::Builder::new()
                 .with_shortcut(Shortcut::new(Some(Modifiers::ALT), Code::Space))
                 .expect("failed to parse shortcut")
                 .with_handler(|app, _shortcut, event| {
-                    if event.state == ShortcutState::Pressed {
-                        toggle_bar(app);
+                    match event.state {
+                        ShortcutState::Pressed => {
+                            // Only fire if not already held.
+                            if !HOTKEY_ACTIVE.swap(true, Ordering::SeqCst) {
+                                toggle_bar(app);
+                            }
+                        }
+                        ShortcutState::Released => {
+                            HOTKEY_ACTIVE.store(false, Ordering::SeqCst);
+                        }
                     }
                 })
-                .build(),
-        )
+                .build()
+        })
         .setup(|app| {
             // Accessory: no Dock icon, no menu bar takeover — the bar is an overlay,
             // not a foreground app.
@@ -2853,7 +2870,10 @@ pub fn run() {
                 let handle = window.clone();
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::Focused(false) = event {
-                        let _ = handle.hide();
+                        // Don't hide if a window command just stole focus temporarily.
+                        if !SUPPRESS_FOCUS_HIDE.load(Ordering::SeqCst) {
+                            let _ = handle.hide();
+                        }
                     }
                 });
             }

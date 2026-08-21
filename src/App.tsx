@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./App.css";
 
 type AppEntry = { name: string; path: string };
@@ -910,7 +909,7 @@ function App() {
         exec().then(setReply).catch((err) => setReply(String(err)));
       } else if (e.key === "Escape") {
         setPending(null);
-        getCurrentWindow().hide();
+        invoke("hide_bar");
       }
       return;
     }

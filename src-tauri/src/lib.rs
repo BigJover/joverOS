@@ -1796,10 +1796,11 @@ fn window_manage(action: String, app_name: Option<String>) -> Result<String, Str
                     }
                     _ => unreachable!()
                 };
-                // Direct app scripting first — works without Accessibility for scriptable apps.
+                // Unminimize first, then snap — bounds can't be set on a minimized window.
                 osa(&format!(
                     r#"tell application "{proc}"
                         activate
+                        set miniaturized of window 1 to false
                         set bounds of window 1 to {{{l}, {t}, {r}, {b}}}
                     end tell"#
                 ));

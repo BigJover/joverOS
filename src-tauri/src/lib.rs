@@ -1,7 +1,13 @@
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
+
+// Prevents the Focused(false) handler from hiding the bar during the
+// brief moment after toggle_bar shows it (show + set_focus causes a
+// transient focus-loss event that would immediately re-hide the bar).
+static JUST_SHOWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(serde::Serialize, Clone)]
 struct AppEntry {
@@ -2817,9 +2823,16 @@ fn toggle_bar(app: &AppHandle) {
     if window.is_visible().unwrap_or(false) {
         let _ = window.hide();
     } else {
+        // Suppress focus-loss hiding for 300ms so the show+focus sequence
+        // doesn't trigger the Focused(false) → hide handler.
+        JUST_SHOWN.store(true, Ordering::SeqCst);
         let _ = window.show();
         let _ = window.set_focus();
         let _ = window.emit("bar-shown", ());
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            JUST_SHOWN.store(false, Ordering::SeqCst);
+        });
     }
 }
 
@@ -2848,7 +2861,9 @@ pub fn run() {
                 let handle = window.clone();
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::Focused(false) = event {
-                        let _ = handle.hide();
+                        if !JUST_SHOWN.load(Ordering::SeqCst) {
+                            let _ = handle.hide();
+                        }
                     }
                 });
             }

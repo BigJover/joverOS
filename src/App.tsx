@@ -909,7 +909,7 @@ function App() {
         exec().then(setReply).catch((err) => setReply(String(err)));
       } else if (e.key === "Escape") {
         setPending(null);
-        setReply("Cancelled — nothing changed.");
+        invoke("hide_bar");
       }
       return;
     }

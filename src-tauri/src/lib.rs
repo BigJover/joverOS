@@ -1,13 +1,18 @@
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 
-// Prevents the Focused(false) handler from hiding the bar during the
-// brief moment after toggle_bar shows it (show + set_focus causes a
-// transient focus-loss event that would immediately re-hide the bar).
-static JUST_SHOWN: AtomicBool = AtomicBool::new(false);
+// Timestamp (ms) when the bar was last shown. Focused(false) is suppressed
+// for 200ms after showing to absorb the transient focus-loss from show+set_focus.
+// 0 = not recently shown, Focused(false) fires normally.
+static SHOWN_AT_MS: AtomicU64 = AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
 
 #[derive(serde::Serialize, Clone)]
 struct AppEntry {
@@ -2811,8 +2816,7 @@ async fn open_url(
 
 #[tauri::command]
 fn hide_bar(app: AppHandle) {
-    // Clear JUST_SHOWN so the Focused(false) handler is allowed to fire.
-    JUST_SHOWN.store(false, Ordering::SeqCst);
+    SHOWN_AT_MS.store(0, Ordering::SeqCst);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
@@ -2823,18 +2827,13 @@ fn toggle_bar(app: &AppHandle) {
         return;
     };
     if window.is_visible().unwrap_or(false) {
+        SHOWN_AT_MS.store(0, Ordering::SeqCst);
         let _ = window.hide();
     } else {
-        // Suppress focus-loss hiding for 300ms so the show+focus sequence
-        // doesn't trigger the Focused(false) → hide handler.
-        JUST_SHOWN.store(true, Ordering::SeqCst);
+        SHOWN_AT_MS.store(now_ms(), Ordering::SeqCst);
         let _ = window.show();
         let _ = window.set_focus();
         let _ = window.emit("bar-shown", ());
-        std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            JUST_SHOWN.store(false, Ordering::SeqCst);
-        });
     }
 }
 
@@ -2863,7 +2862,8 @@ pub fn run() {
                 let handle = window.clone();
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::Focused(false) = event {
-                        if !JUST_SHOWN.load(Ordering::SeqCst) {
+                        let age = now_ms().saturating_sub(SHOWN_AT_MS.load(Ordering::SeqCst));
+                        if age > 200 {
                             let _ = handle.hide();
                         }
                     }

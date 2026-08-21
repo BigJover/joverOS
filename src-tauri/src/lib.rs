@@ -2811,6 +2811,8 @@ async fn open_url(
 
 #[tauri::command]
 fn hide_bar(app: AppHandle) {
+    // Clear JUST_SHOWN so the Focused(false) handler is allowed to fire.
+    JUST_SHOWN.store(false, Ordering::SeqCst);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
@@ -2830,7 +2832,7 @@ fn toggle_bar(app: &AppHandle) {
         let _ = window.set_focus();
         let _ = window.emit("bar-shown", ());
         std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            std::thread::sleep(std::time::Duration::from_millis(150));
             JUST_SHOWN.store(false, Ordering::SeqCst);
         });
     }

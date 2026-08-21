@@ -1699,6 +1699,138 @@ fn media_shuffle(on: bool) -> Result<String, String> {
     }
 }
 
+// --- Window Management (M9) ──────────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+fn screen_size() -> (i32, i32) {
+    let raw = osa(r#"tell application "Finder" to get bounds of window of desktop"#);
+    let parts: Vec<i32> = raw.trim().split(", ")
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    if parts.len() >= 4 { (parts[2], parts[3]) } else { (1440, 900) }
+}
+
+// Normalize user-supplied app name to the real process name.
+fn proc_name(app: &str) -> String {
+    match app.to_lowercase().trim() {
+        "vscode" | "vs code" | "visual studio code" | "code" => "Code".into(),
+        "chrome"                                              => "Google Chrome".into(),
+        "word"                                               => "Microsoft Word".into(),
+        "excel"                                              => "Microsoft Excel".into(),
+        "powerpoint"                                         => "Microsoft PowerPoint".into(),
+        other => {
+            let mut chars = other.chars();
+            chars.next().map(|c| c.to_uppercase().to_string()).unwrap_or_default() + chars.as_str()
+        }
+    }
+}
+
+#[tauri::command]
+fn window_manage(action: String, app_name: Option<String>) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let raw_app = app_name.as_deref().unwrap_or("").trim().to_string();
+        let proc = proc_name(&raw_app);
+
+        match action.as_str() {
+            "focus" => {
+                if proc.is_empty() { return Err("Specify an app to focus.".into()); }
+                osa(&format!("tell application \"{}\" to activate", proc));
+                return Ok(format!("Focused {proc}."));
+            }
+            "minimize" => {
+                if proc.is_empty() { return Err("Specify an app to minimize.".into()); }
+                osa(&format!(
+                    r#"tell application "{proc}" to activate
+                    tell application "System Events"
+                        tell process "{proc}"
+                            set miniaturized of window 1 to true
+                        end tell
+                    end tell"#
+                ));
+                return Ok(format!("Minimized {proc}."));
+            }
+            "hide" => {
+                if proc.is_empty() { return Err("Specify an app to hide.".into()); }
+                osa(&format!(
+                    "tell application \"System Events\" to set visible of process \"{}\" to false",
+                    proc
+                ));
+                return Ok(format!("Hid {proc}."));
+            }
+            "hide_all" => {
+                // Cmd+Option+H hides all background apps, keeping the frontmost visible.
+                osa(r#"tell application "System Events" to keystroke "h" using {command down, option down}"#);
+                return Ok("Hid background windows.".into());
+            }
+            "show" => {
+                if proc.is_empty() { return Err("Specify an app to show.".into()); }
+                osa(&format!("tell application \"{}\" to activate", proc));
+                return Ok(format!("Showed {proc}."));
+            }
+            "show_all" => {
+                osa(r#"tell application "System Events" to set visible of every process to true"#);
+                return Ok("Showed all windows.".into());
+            }
+            "fullscreen" => {
+                if proc.is_empty() { return Err("Specify an app.".into()); }
+                osa(&format!(
+                    r#"tell application "{proc}" to activate
+                    tell application "System Events"
+                        tell process "{proc}"
+                            keystroke "f" using {{control down, command down}}
+                        end tell
+                    end tell"#
+                ));
+                return Ok(format!("Toggled fullscreen for {proc}."));
+            }
+            snap @ ("snap_left" | "snap_right" | "snap_top" | "snap_bottom" | "center") => {
+                if proc.is_empty() { return Err("Specify an app to snap.".into()); }
+                let (sw, sh) = screen_size();
+                let mb = 25i32;
+                let (l, t, r, b) = match snap {
+                    "snap_left"   => (0,      mb,      sw / 2, sh),
+                    "snap_right"  => (sw / 2, mb,      sw,     sh),
+                    "snap_top"    => (0,      mb,      sw,     mb + (sh - mb) / 2),
+                    "snap_bottom" => (0,      mb + (sh - mb) / 2, sw, sh),
+                    "center" => {
+                        let ww = sw * 2 / 3;
+                        let wh = (sh - mb) * 2 / 3;
+                        let cx = (sw - ww) / 2;
+                        let cy = mb + ((sh - mb) - wh) / 2;
+                        (cx, cy, cx + ww, cy + wh)
+                    }
+                    _ => unreachable!()
+                };
+                osa(&format!(
+                    r#"tell application "{proc}" to activate
+                    tell application "System Events"
+                        tell process "{proc}"
+                            set bounds of window 1 to {{{l}, {t}, {r}, {b}}}
+                        end tell
+                    end tell"#
+                ));
+                let label = snap.replace("snap_", "");
+                return Ok(format!("Snapped {proc} to the {label}."));
+            }
+            _ => return Err(format!("Unknown window action: {action}")),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let app = app_name.as_deref().unwrap_or("").trim().to_string();
+        match action.as_str() {
+            "focus" => {
+                if Command::new("wmctrl").args(["-a", &app]).status().map(|s| s.success()).unwrap_or(false) {
+                    return Ok(format!("Focused {app}."));
+                }
+                return Err("wmctrl not found — install it for window management on Linux.".into());
+            }
+            _ => return Ok("Install wmctrl and xdotool for full window management on Linux.".into()),
+        }
+    }
+}
+
 // --- Play Track (M8b) — search + play a specific song ───────────────────────
 
 #[tauri::command]
@@ -2778,7 +2910,8 @@ pub fn run() {
             now_playing,
             media_shuffle,
             play_track,
-            setup_spotify
+            setup_spotify,
+            window_manage
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

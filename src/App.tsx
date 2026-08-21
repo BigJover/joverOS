@@ -473,6 +473,65 @@ function App() {
         return;
       }
 
+      // Window Management (M9)
+      // "snap safari left/right/top/bottom/center"
+      const snapM = t.match(/^snap\s+(.+?)\s+(left|right|top|bottom|center)$/i);
+      if (snapM) {
+        setReply(await invoke<string>("window_manage", {
+          action: `snap_${snapM[2].toLowerCase()}`,
+          appName: snapM[1].trim(),
+        }));
+        return;
+      }
+      // "center safari"
+      const centerWinM = t.match(/^center\s+(.+)$/i);
+      if (centerWinM) {
+        setReply(await invoke<string>("window_manage", { action: "center", appName: centerWinM[1].trim() }));
+        return;
+      }
+      // "fullscreen spotify" / "spotify fullscreen" / "make spotify fullscreen"
+      const fullscreenM =
+        t.match(/^(?:fullscreen|make\s+fullscreen|toggle\s+fullscreen)\s+(.+)$/i) ??
+        t.match(/^(?:make\s+)?(.+?)\s+(?:full\s*screen|fullscreen)$/i);
+      if (fullscreenM) {
+        setReply(await invoke<string>("window_manage", { action: "fullscreen", appName: fullscreenM[1].trim() }));
+        return;
+      }
+      // "minimize safari"
+      const minimizeM = t.match(/^(?:minimize|minimise)\s+(.+)$/i);
+      if (minimizeM) {
+        setReply(await invoke<string>("window_manage", { action: "minimize", appName: minimizeM[1].trim() }));
+        return;
+      }
+      // "focus safari" / "bring safari to front"
+      const focusWinM =
+        t.match(/^focus\s+(.+)$/i) ??
+        t.match(/^bring\s+(.+?)\s+(?:to\s+)?(?:the\s+)?front(?:ward)?$/i);
+      if (focusWinM) {
+        setReply(await invoke<string>("window_manage", { action: "focus", appName: focusWinM[1].trim() }));
+        return;
+      }
+      // "hide all" / "hide safari"
+      if (/^hide\s+all$/i.test(t)) {
+        setReply(await invoke<string>("window_manage", { action: "hide_all", appName: undefined }));
+        return;
+      }
+      const hideWinM = t.match(/^hide\s+(.+)$/i);
+      if (hideWinM) {
+        setReply(await invoke<string>("window_manage", { action: "hide", appName: hideWinM[1].trim() }));
+        return;
+      }
+      // "show all" / "show safari"
+      if (/^show\s+all$/i.test(t)) {
+        setReply(await invoke<string>("window_manage", { action: "show_all", appName: undefined }));
+        return;
+      }
+      const showWinM = t.match(/^show\s+(.+)$/i);
+      if (showWinM) {
+        setReply(await invoke<string>("window_manage", { action: "show", appName: showWinM[1].trim() }));
+        return;
+      }
+
       // Game Mode (M7)
       // "game mode off"
       if (/^game\s+mode\s+off$/i.test(t)) {

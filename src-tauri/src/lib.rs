@@ -1718,6 +1718,13 @@ fn proc_name(app: &str) -> String {
         "word"                                               => "Microsoft Word".into(),
         "excel"                                              => "Microsoft Excel".into(),
         "powerpoint"                                         => "Microsoft PowerPoint".into(),
+        "claude"                                             => "Claude".into(),
+        "discord"                                            => "Discord".into(),
+        "slack"                                              => "Slack".into(),
+        "notion"                                             => "Notion".into(),
+        "figma"                                              => "Figma".into(),
+        "telegram"                                           => "Telegram".into(),
+        "whatsapp"                                           => "WhatsApp".into(),
         other => {
             let mut chars = other.chars();
             chars.next().map(|c| c.to_uppercase().to_string()).unwrap_or_default() + chars.as_str()
@@ -1740,13 +1747,17 @@ fn window_manage(action: String, app_name: Option<String>) -> Result<String, Str
             }
             "minimize" => {
                 if proc.is_empty() { return Err("Specify an app to minimize.".into()); }
-                // Direct app scripting — no Accessibility needed for scriptable apps.
-                osa(&format!(
-                    r#"tell application "{proc}"
-                        activate
-                        set miniaturized of window 1 to true
-                    end tell"#
+                // Try direct scripting first; fall back to System Events for non-scriptable apps.
+                let result = osa(&format!(
+                    r#"try
+                        tell application "{proc}" to set miniaturized of window 1 to true
+                    on error
+                        tell application "System Events"
+                            tell process "{proc}" to set miniaturized of window 1 to true
+                        end tell
+                    end try"#
                 ));
+                let _ = result;
                 return Ok(format!("Minimized {proc}."));
             }
             "hide" => {
@@ -1796,13 +1807,24 @@ fn window_manage(action: String, app_name: Option<String>) -> Result<String, Str
                     }
                     _ => unreachable!()
                 };
-                // Unminimize first, then snap — bounds can't be set on a minimized window.
+                // Try direct scripting; fall back to System Events for non-scriptable apps.
                 osa(&format!(
-                    r#"tell application "{proc}"
-                        activate
-                        set miniaturized of window 1 to false
-                        set bounds of window 1 to {{{l}, {t}, {r}, {b}}}
-                    end tell"#
+                    r#"try
+                        tell application "{proc}"
+                            activate
+                            set miniaturized of window 1 to false
+                            set bounds of window 1 to {{{l}, {t}, {r}, {b}}}
+                        end tell
+                    on error
+                        tell application "{proc}" to activate
+                        tell application "System Events"
+                            tell process "{proc}"
+                                set miniaturized of window 1 to false
+                                set size of window 1 to {{{r} - {l}, {b} - {t}}}
+                                set position of window 1 to {{{l}, {t}}}
+                            end tell
+                        end tell
+                    end try"#
                 ));
                 let label = snap.replace("snap_", "");
                 return Ok(format!("Snapped {proc} to the {label}."));

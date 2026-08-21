@@ -9,8 +9,6 @@ use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 // for 200ms after showing to absorb the transient focus-loss from show+set_focus.
 // 0 = not recently shown, Focused(false) fires normally.
 static SHOWN_AT_MS: AtomicU64 = AtomicU64::new(0);
-// Own visibility tracking — is_visible() can return stale state after hide.
-static BAR_VISIBLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
@@ -2818,7 +2816,6 @@ async fn open_url(
 
 #[tauri::command]
 fn hide_bar(app: AppHandle) {
-    BAR_VISIBLE.store(false, Ordering::SeqCst);
     SHOWN_AT_MS.store(0, Ordering::SeqCst);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
@@ -2827,11 +2824,10 @@ fn hide_bar(app: AppHandle) {
 
 fn toggle_bar(app: &AppHandle) {
     let Some(window) = app.get_webview_window("main") else { return; };
-    if BAR_VISIBLE.swap(false, Ordering::SeqCst) {
+    if window.is_visible().unwrap_or(false) {
         SHOWN_AT_MS.store(0, Ordering::SeqCst);
         let _ = window.hide();
     } else {
-        BAR_VISIBLE.store(true, Ordering::SeqCst);
         SHOWN_AT_MS.store(now_ms(), Ordering::SeqCst);
         let _ = window.show();
         let _ = window.set_focus();
@@ -2866,7 +2862,6 @@ pub fn run() {
                     if let tauri::WindowEvent::Focused(false) = event {
                         let age = now_ms().saturating_sub(SHOWN_AT_MS.load(Ordering::SeqCst));
                         if age > 200 {
-                            BAR_VISIBLE.store(false, Ordering::SeqCst);
                             let _ = handle.hide();
                         }
                     }
